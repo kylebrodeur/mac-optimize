@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# mac-reclaim — reclaim regrowing dev/agent caches on macOS, safely.
+#
+# TWO tiers, different safety models:
+#   SAFE (default): caches tools rebuild on demand + leftover installers + stale
+#     logs. Safe *by construction* — pnpm/uv decide what's unreferenced; npm's
+#     _cacache is a redownload cache; node_modules are never touched.
+#   DEEP (--deep): stale agent STATE. Removed only with EVIDENCE it's unused:
+#     - VS Code workspaceStorage: only if its workspace.json points to a folder
+#       that no longer exists (orphan). Alive project => always kept.
+#     - vm_bundles / agent sessions / .claude projects: only if idle >KEEP_DAYS,
+#       beyond the newest $KEEP_RECENT, not open by any process, not allowlisted.
+#
+# Usage:
+#   mac-reclaim                 reclaim safe caches (unattended-safe)
+#   mac-reclaim --deep          + prune proven-unused agent state (prompts)
+#   mac-reclaim --deep --dry-run   show what deep WOULD remove, and why. Deletes nothing.
+#   mac-reclaim --deep --yes    deep prune without prompting (automation)
+#   mac-reclaim --quiet         summary line only
+#
+# Env: KEEP_DAYS=30  KEEP_RECENT=5
+# Allowlist: ~/.config/mac-reclaim/keep.txt — one substring/glob per line;
+#            any candidate path matching a line is never removed.
+
+set -uo pipefail
+
+DATA_VOL="/System/Volumes/Data"
+LOG="$HOME/Library/Logs/mac-reclaim.log"
+AS="$HOME/Library/Application Support"
+KEEPFILE="$HOME/.config/mac-reclaim/keep.txt"
+KEEP_DAYS="${KEEP_DAYS:-30}"
+KEEP_RECENT="${KEEP_RECENT:-5}"
+DEEP=0; ASSUME_YES=0; QUIET=0; DRYRUN=0
+
+for a in "$@"; do
+  case "$a" in
+    --deep) DEEP=1 ;;
+    --dry-run|-n) DRYRUN=1; DEEP=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    --quiet|-q) QUIET=1 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) echo "unknown flag: $a" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$(dirname "$LOG")" "$(dirname "$KEEPFILE")"
+[ -f "$KEEPFILE" ] || printf '# mac-reclaim allowlist — one path substring per line; matches are never pruned.\n' >"$KEEPFILE"
+
+avail_kb() { df -k "$DATA_VOL" | awk 'NR==2{print $4}'; }
+say()     { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
+scrub()   { for p in "$@"; do [ -e "$p" ] && rm -rf "$p"; done; return 0; }
+
+# --- safety guards for the deep tier ---
+is_allowlisted() {                     # $1=path ; true if matches any keep.txt line
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue; case "$line" in \#*) continue;; esac
+    case "$1" in *"$line"*) return 0;; esac
+  done <"$KEEPFILE"
+  return 1
+}
+dir_open() {                           # $1=path ; true if a process has it open
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -- "$1" >/dev/null 2>&1 && return 0
+  lsof +D "$1" >/dev/null 2>&1        # deep check (bundles hold an open disk image)
+}
+ws_folder_status() {                   # echoes: orphan | alive | unknown
+  local js="$1/workspace.json" p
+  [ -f "$js" ] || { echo unknown; return; }
+  p=$(python3 - "$js" 2>/dev/null <<'PY'
+import json,sys,urllib.parse
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+u=d.get('folder') or d.get('workspace') or ''
+if u.startswith('file://'): print(urllib.parse.unquote(u[7:]))
+PY
+)
+  [ -z "$p" ] && { echo unknown; return; }
+  [ -e "$p" ] && echo alive || echo orphan
+}
+
+START_KB=$(avail_kb)
+say "mac-reclaim: safe caches…"
+
+# ---------- SAFE TIER (safe by construction) ----------
+if [ "$DRYRUN" != 1 ]; then
+  scrub "$HOME/.npm/_cacache" "$HOME/.npm/_npx"
+  command -v pnpm >/dev/null 2>&1 && pnpm store prune >/dev/null 2>&1
+  command -v uv   >/dev/null 2>&1 && uv cache prune  >/dev/null 2>&1
+  command -v brew >/dev/null 2>&1 && brew cleanup -s >/dev/null 2>&1
+  command -v bun  >/dev/null 2>&1 && bun pm cache rm >/dev/null 2>&1
+  scrub "$HOME/.cache/codex-runtimes" "$HOME/.cache/node"
+  scrub "$HOME"/Library/Caches/*.ShipIt
+  scrub "$AS/Code/CachedExtensionVSIXs" "$AS/Code/Cache" "$AS/Code/CachedData" "$AS/Code/Crashpad"
+  for d in CreativeCloud Claude com.openai.codex Adobe; do
+    [ -d "$HOME/Library/Logs/$d" ] && find "$HOME/Library/Logs/$d" -type f -delete 2>/dev/null
+  done
+else
+  say "  (dry-run: safe tier skipped; showing deep candidates only)"
+fi
+
+# ---------- DEEP TIER (evidence-based) ----------
+if [ "$DEEP" = 1 ]; then
+  say ""; say "Deep tier — proven-unused agent state (KEEP_DAYS=$KEEP_DAYS, keep newest $KEEP_RECENT):"
+  DELETE=(); REASON=()
+
+  add() { DELETE+=("$1"); REASON+=("$2"); }
+
+  # VS Code workspaceStorage: orphan-only (referenced project folder is gone).
+  wsroot="$AS/Code/User/workspaceStorage"
+  if [ -d "$wsroot" ]; then
+    for d in "$wsroot"/*/; do
+      d="${d%/}"; [ -d "$d" ] || continue
+      is_allowlisted "$d" && continue
+      st=$(ws_folder_status "$d")
+      if [ "$st" = orphan ] && ! dir_open "$d"; then add "$d" "orphan: project folder gone"; fi
+    done
+  fi
+
+  # Idle-based: vm_bundles, agent sessions, .claude projects — keep newest N, age-gate rest.
+  for base in "$AS/Claude/vm_bundles" "$AS/Claude/local-agent-mode-sessions" "$HOME/.claude/projects"; do
+    [ -d "$base" ] || continue
+    # newest-first by mtime; skip the first KEEP_RECENT, consider the rest.
+    idx=0
+    while IFS= read -r d; do
+      idx=$((idx+1))
+      [ "$idx" -le "$KEEP_RECENT" ] && continue
+      is_allowlisted "$d" && continue
+      # idle > KEEP_DAYS and not currently open
+      if [ -n "$(find "$d" -maxdepth 0 -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && ! dir_open "$d"; then
+        add "$d" "idle >${KEEP_DAYS}d, rank #$idx"
+      fi
+    done < <(ls -dt "$base"/*/ 2>/dev/null | sed 's:/$::')
+  done
+
+  if [ "${#DELETE[@]}" -eq 0 ]; then
+    say "  no candidates — everything is in use, recent, or allowlisted."
+  else
+    for i in "${!DELETE[@]}"; do
+      printf '  %-7s  %-26s  %s\n' \
+        "$(du -sh "${DELETE[$i]}" 2>/dev/null | cut -f1)" "${REASON[$i]}" "${DELETE[$i]/#$HOME/~}"
+    done
+    if [ "$DRYRUN" = 1 ]; then
+      say ""; say "  dry-run: nothing removed. Re-run without --dry-run to prune."
+    else
+      ok=1
+      if [ "$ASSUME_YES" != 1 ]; then
+        printf 'Remove these %d entries? [y/N] ' "${#DELETE[@]}"; read -r ans
+        [ "$ans" = y ] || [ "$ans" = Y ] || ok=0
+      fi
+      if [ "$ok" = 1 ]; then
+        for d in "${DELETE[@]}"; do rm -rf "$d"; done
+        logline "deep: removed ${#DELETE[@]} proven-unused entries"
+      else say "  skipped."; fi
+    fi
+  fi
+fi
+
+# self-cap this log (the journald lesson)
+[ -f "$LOG" ] && { tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }
+
+END_KB=$(avail_kb); FREED_MB=$(( (END_KB-START_KB)/1024 )); AVAIL_GB=$(( END_KB/1024/1024 ))
+if [ "$DRYRUN" != 1 ]; then
+  logline "$([ "$DEEP" = 1 ] && echo deep || echo safe): freed ${FREED_MB}MB, ${AVAIL_GB}GB free"
+  say "mac-reclaim: freed ${FREED_MB} MB — ${AVAIL_GB} GB free on ${DATA_VOL}"
+fi

@@ -1,0 +1,67 @@
+---
+name: mac-optimize
+description: Diagnose and reclaim disk space and audit stray git worktrees on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", or "find/clean git worktrees"; or for routine maintenance. Drives the diskreport, mac-reclaim, and worktree-audit command-line tools with a safety-first workflow.
+compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
+license: MIT
+metadata:
+  author: kylebrodeur
+  version: "1.0"
+---
+
+# mac-optimize
+
+Reclaim disk and keep a macOS coding-agent machine healthy — **without ever deleting work that isn't provably recoverable.** These machines fill up because every agent run appends to caches (npm, pnpm, uv, codex runtimes, editor workspace storage) that grow on write and never self-reclaim, plus stray git worktrees from parallel agent tasks.
+
+The tools do the work; this skill is the workflow and the guardrails.
+
+## 1. Diagnose first (read-only)
+
+```
+diskreport
+```
+
+Shows the volume's free space, top consumers in `~/Library/Application Support` and `~/Library/Caches`, the dev/agent caches that regrow, and a REVIEW tier of large-but-real state (VS Code `workspaceStorage`, Claude `vm_bundles`). It also flags APFS local snapshots — the classic "invisible" disk sink. Never destructive.
+
+## 2. Reclaim safe caches
+
+```
+mac-reclaim
+```
+
+Default mode clears only caches that rebuild on demand and leftover installers/logs. This is **safe by construction**: `pnpm store prune`/`uv cache prune` remove only unreferenced packages; `npm`'s `_cacache` is a re-download cache; installed `node_modules` are never touched. Nothing you're using can be lost. Run this freely.
+
+## 3. Deeper reclaim — ALWAYS dry-run first
+
+Only if step 2 isn't enough:
+
+```
+mac-reclaim --deep --dry-run     # shows every candidate + WHY it's considered unused
+mac-reclaim --deep               # prompts before deleting
+```
+
+The deep tier prunes stale agent state (orphaned VS Code `workspaceStorage`, old `vm_bundles`, aged `.claude/projects`). It is **evidence-based**, guarded by: an `lsof` open-file check (skip anything in use), keep-newest-N, an age gate (`KEEP_DAYS`), and an allowlist at `~/.config/mac-reclaim/keep.txt`. Never run `--deep` unattended or with `--yes` unless the user has reviewed a dry-run.
+
+## 4. Audit and reclaim git worktrees
+
+```
+worktree-audit
+```
+
+Classifies every stray worktree:
+- **SAFE** — clean working tree AND every commit is reachable from another ref (merged, tagged, or pushed). Removing it loses nothing. Reclaim with `worktree-audit --prune`.
+- **REVIEW** — has uncommitted changes and/or commits that exist on no other ref. **Do not delete.** Archive it first:
+
+```
+worktree-audit --backup          # incremental git bundle (+ patch/tarball if dirty)
+worktree-audit --backup --prune  # archive, then remove the ones that archived cleanly
+```
+
+Locked worktrees are always skipped. Backups land in `~/.local/share/worktree-backups/` with a `manifest.tsv` of restore commands.
+
+## The rule
+
+Caches are safe-by-construction — clear them. Anything holding potentially-unrecoverable work (REVIEW worktrees, uncommitted changes) is **backed up, never deleted.** When unsure, prefer `diskreport` and dry-runs over action.
+
+## Details
+
+Full flag/env tables, the deep-tier guards, and worktree restore recipes are in [references/reference.md](references/reference.md). Load it only when you need specifics.

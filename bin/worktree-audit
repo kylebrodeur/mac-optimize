@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# worktree-audit — find stray git worktrees and classify each by whether it is
+# SAFE to remove, i.e. whether removing it could lose work.
+#
+# A worktree is only SAFE when ALL are true:
+#   * not the main worktree, not locked
+#   * working tree is clean (no uncommitted changes)
+#   * every commit on its branch is already reachable from another ref
+#     (merged / tagged / pushed) — nothing unique would be lost
+# Anything with uncommitted changes, or commits not pushed/merged, is REVIEW —
+# never auto-removed. This is the check the naive `git worktree remove` skips.
+#
+# Usage:
+#   worktree-audit [ROOT ...]        audit worktrees under ROOTs (default: ~/workspace)
+#   worktree-audit --prune           remove the SAFE ones (prompts; --yes to skip)
+#   worktree-audit --backup          archive REVIEW worktrees to git bundles, then
+#                                    they're safe to prune (select which; --yes = all)
+#   worktree-audit --backup --prune  archive REVIEW worktrees AND remove the ones
+#                                    that backed up OK (+ prune SAFE ones)
+#
+# Backups: incremental git bundles (unique commits only) + captured uncommitted
+# patch/untracked tarball for dirty trees, in $WORKTREE_BACKUP_DIR
+# (default ~/.local/share/worktree-backups), logged to manifest.tsv with a
+# ready-to-paste restore command. Read-only unless --prune/--backup.
+
+set -uo pipefail
+PRUNE=0; ASSUME_YES=0; BACKUP=0; ROOTS=()
+for a in "$@"; do
+  case "$a" in
+    --prune) PRUNE=1 ;;
+    --backup) BACKUP=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    *) ROOTS+=("$a") ;;
+  esac
+done
+[ "${#ROOTS[@]}" -eq 0 ] && ROOTS=("$HOME/workspace")
+BACKUP_DIR="${WORKTREE_BACKUP_DIR:-$HOME/.local/share/worktree-backups}"
+
+bold=$'\033[1m'; grn=$'\033[32m'; ylw=$'\033[33m'; dim=$'\033[2m'; rst=$'\033[0m'
+
+# Discover main repos that have linked worktrees (contain .git/worktrees).
+mains=()
+while IFS= read -r wtdir; do
+  mains+=("$(dirname "$(dirname "$wtdir")")")
+done < <(find "${ROOTS[@]}" \( -name node_modules -o -name .cache -o -name Library \) -prune \
+           -o -type d -path "*/.git/worktrees" -print 2>/dev/null | sort -u)
+
+if [ "${#mains[@]}" -eq 0 ]; then echo "No repos with linked worktrees under: ${ROOTS[*]}"; exit 0; fi
+
+SAFE_LIST=(); SAFE_REPO=(); total_safe_kb=0
+# REVIEW candidates (for --backup), collected in parallel arrays.
+RV_WT=(); RV_REPO=(); RV_BR=(); RV_REF=(); RV_DIRTY=(); RV_REASON=(); RV_SIZE=()
+
+default_branch() {   # $1=repo
+  git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' && return
+  for b in main master; do git -C "$1" show-ref --verify -q "refs/heads/$b" && { echo "$b"; return; }; done
+}
+
+# Refs that would preserve a commit if THIS worktree is removed: every ref except
+# the worktree's own branch. Shared by the audit check and the backup boundary.
+exclude_refs() {  # $1=repo  $2=own-branch-ref ; prints one ref per line
+  git -C "$1" for-each-ref --format='%(refname)' refs/heads refs/tags refs/remotes 2>/dev/null | grep -vxF "$2"
+}
+
+for MAIN in "${mains[@]}"; do
+  [ -d "$MAIN/.git" ] || [ -f "$MAIN/.git" ] || continue
+  DEF=$(default_branch "$MAIN")
+  printf '\n%s══ %s%s  %s(default: %s)%s\n' "$bold" "${MAIN/#$HOME/~}" "$rst" "$dim" "${DEF:-?}" "$rst"
+
+  # Parse porcelain into: path \t branch \t flags. Feed the loop via process
+  # substitution, NOT a pipe — a pipe runs the loop in a subshell and the
+  # arrays we build would silently vanish at the pipe's end.
+  first=1
+  while IFS=$'\t' read -r WT BR FL; do
+      if [ "$first" = 1 ]; then first=0; continue; fi          # skip main worktree
+      short="${WT/#$HOME/~}"; br="${BR#refs/heads/}"
+      if [ "$FL" = locked ]; then printf '  %s%-6s%s %-9s %s\n' "$ylw" "KEEP" "$rst" "locked" "$short"; continue; fi
+      if [ ! -d "$WT" ]; then printf '  %s%-6s%s %-9s %s\n' "$dim" "GONE" "$rst" "dir missing" "$short"; continue; fi
+
+      dirty=0; [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ] && dirty=1
+      ref=$(git -C "$WT" rev-parse HEAD 2>/dev/null)
+      unique="?"
+      if [ -n "$ref" ]; then
+        # Commits reachable from THIS worktree but from no OTHER ref => removal
+        # loses them. Zero => preserved elsewhere (merged/tagged/pushed).
+        exclude=$(exclude_refs "$MAIN" "$BR")
+        unique=$(git -C "$MAIN" rev-list "$ref" --not $exclude 2>/dev/null | wc -l | tr -d ' ')
+      fi
+      idle=$(( ( $(date +%s) - $(stat -f %m "$WT" 2>/dev/null || echo 0) ) / 86400 ))
+      size=$(du -sh "$WT" 2>/dev/null | cut -f1)
+
+      state="clean"; [ "$dirty" = 1 ] && state="DIRTY"
+      sync="merged/pushed"; [ "$unique" != 0 ] && sync="${unique} unmerged"
+
+      if [ "$dirty" = 0 ] && [ "$unique" = 0 ]; then
+        verdict="SAFE"; col="$grn"
+        SAFE_LIST+=("$WT"); SAFE_REPO+=("$MAIN")
+        kb=$(du -sk "$WT" 2>/dev/null | cut -f1); total_safe_kb=$(( total_safe_kb + ${kb:-0} ))
+      else
+        verdict="REVIEW"; col="$ylw"
+        RV_WT+=("$WT"); RV_REPO+=("$MAIN"); RV_BR+=("$BR"); RV_REF+=("$ref")
+        RV_DIRTY+=("$dirty"); RV_REASON+=("$state, $sync"); RV_SIZE+=("$size")
+      fi
+      printf '  %s%-6s%s %6s  %3sd  %-6s %-14s %s%s%s\n' \
+        "$col" "$verdict" "$rst" "$size" "$idle" "$state" "$sync" "$dim" "$short" "$rst"
+  done < <(git -C "$MAIN" worktree list --porcelain 2>/dev/null | awk '
+    /^worktree /{if(wt)print wt"\t"br"\t"fl; wt=substr($0,10);br="";fl=""}
+    /^branch /{br=$2} /^detached/{br="(detached)"} /^locked/{fl="locked"} /^bare/{fl="bare"}
+    END{if(wt)print wt"\t"br"\t"fl}')
+done
+
+# ---- expand a selection string ("all", "1-3,5") to 0-based indices ----
+parse_selection() {  # $1=sel  $2=count ; prints 0-based indices, deduped/sorted
+  local sel="$1" count="$2" part lo hi i
+  if [ "$sel" = all ] || [ "$sel" = ALL ]; then
+    for ((i=0;i<count;i++)); do echo "$i"; done; return
+  fi
+  local oldifs="$IFS"; IFS=','; set -- $sel; IFS="$oldifs"
+  for part in "$@"; do
+    part="${part// /}"; [ -z "$part" ] && continue
+    if [[ "$part" == *-* ]]; then
+      lo="${part%-*}"; hi="${part#*-}"
+      [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || continue
+      for ((i=lo;i<=hi;i++)); do [ "$i" -ge 1 ] && [ "$i" -le "$count" ] && echo "$((i-1))"; done
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      [ "$part" -ge 1 ] && [ "$part" -le "$count" ] && echo "$((part-1))"
+    fi
+  done | sort -un
+}
+
+# ---- back up one REVIEW worktree by index; echo "OK" on verified success ----
+backup_one() {  # $1=index
+  local i="$1"
+  local WT="${RV_WT[$i]}" MAIN="${RV_REPO[$i]}" BR="${RV_BR[$i]}" ref="${RV_REF[$i]}" dirty="${RV_DIRTY[$i]}"
+  local repo_base br_slug bundle_ref restore_ref ts stem out exclude unt
+  repo_base=$(basename "$MAIN")
+  if [ "$BR" = "(detached)" ] || [ -z "$BR" ]; then
+    br_slug="detached-${ref:0:8}"; bundle_ref="$ref"; restore_ref="$ref"       # restore by sha
+  else
+    br_slug="${BR#refs/heads/}"; br_slug="${br_slug//\//-}"
+    bundle_ref="$BR"; restore_ref="$BR:$BR"                                     # recreate the branch
+  fi
+  ts=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$BACKUP_DIR"
+  stem="$BACKUP_DIR/${repo_base}__${br_slug}__${ts}"; out="$stem.bundle"
+  exclude=$(exclude_refs "$MAIN" "$BR")
+  # Incremental bundle: only commits unique to this worktree (prereqs = the base
+  # that survives in MAIN). Empty range would fail — fall back to full ref.
+  if ! git -C "$MAIN" bundle create "$out" "$bundle_ref" --not $exclude >/dev/null 2>&1; then
+    git -C "$MAIN" bundle create "$out" "$bundle_ref" >/dev/null 2>&1 || { echo "FAIL"; return; }
+  fi
+  git -C "$MAIN" bundle verify "$out" >/dev/null 2>&1 || { echo "FAIL"; return; }
+
+  if [ "$dirty" = 1 ]; then
+    git -C "$WT" diff HEAD --binary > "$stem.uncommitted.patch" 2>/dev/null
+    unt=$(git -C "$WT" ls-files --others --exclude-standard 2>/dev/null)
+    if [ -n "$unt" ]; then
+      git -C "$WT" ls-files --others --exclude-standard -z 2>/dev/null \
+        | tar -czf "$stem.untracked.tar.gz" -C "$WT" --null -T - 2>/dev/null
+    fi
+  fi
+
+  local mf="$BACKUP_DIR/manifest.tsv" restore
+  [ -f "$mf" ] || printf 'timestamp\trepo\tref\tsha\tdirty\tbundle\trestore\n' > "$mf"
+  restore="git -C \"$MAIN\" fetch \"$out\" \"$restore_ref\""
+  [ "$dirty" = 1 ] && restore="$restore  # then: git -C <wt> apply \"$stem.uncommitted.patch\"; tar xzf \"$stem.untracked.tar.gz\" -C <wt>"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$ts" "$MAIN" "$BR" "$ref" "$([ "$dirty" = 1 ] && echo yes || echo no)" "$out" "$restore" >> "$mf"
+  echo "OK $out"
+}
+
+# ---- SAFE reporting / prune (unchanged behavior) ----
+echo
+if [ "${#SAFE_LIST[@]}" -eq 0 ]; then
+  echo "No worktrees are provably safe to remove. (REVIEW = uncommitted or unpushed work.)"
+else
+  printf '%s%d worktrees SAFE to remove%s (~%d MB): clean + fully merged/pushed.\n' \
+    "$bold" "${#SAFE_LIST[@]}" "$rst" "$(( total_safe_kb / 1024 ))"
+  if [ "$PRUNE" = 1 ]; then
+    ok=1
+    if [ "$ASSUME_YES" != 1 ]; then printf 'Remove them? [y/N] '; read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || ok=0; fi
+    if [ "$ok" = 1 ]; then
+      for i in "${!SAFE_LIST[@]}"; do
+        git -C "${SAFE_REPO[$i]}" worktree remove "${SAFE_LIST[$i]}" 2>/dev/null \
+          && echo "  removed ${SAFE_LIST[$i]/#$HOME/~}" \
+          || echo "  ${ylw}skipped${rst} (git refused) ${SAFE_LIST[$i]/#$HOME/~}"
+      done
+      for MAIN in "${mains[@]}"; do git -C "$MAIN" worktree prune 2>/dev/null; done
+    else echo "  skipped."; fi
+  elif [ "$BACKUP" != 1 ]; then
+    echo "Run 'worktree-audit --prune' to remove the SAFE ones."
+  fi
+fi
+
+# ---- BACKUP: archive REVIEW worktrees (optionally prune the backed-up ones) ----
+if [ "$BACKUP" = 1 ]; then
+  echo
+  if [ "${#RV_WT[@]}" -eq 0 ]; then
+    echo "No REVIEW worktrees to back up."
+  else
+    echo "${bold}REVIEW worktrees — candidates for backup:${rst}"
+    for i in "${!RV_WT[@]}"; do
+      printf '  [%d] %6s  %-22s %s\n' "$((i+1))" "${RV_SIZE[$i]}" "${RV_REASON[$i]}" "${RV_WT[$i]/#$HOME/~}"
+    done
+    if [ "$ASSUME_YES" = 1 ]; then sel="all"
+    else printf 'Back up which? (e.g. 1-3,5 or all; empty to cancel): '; read -r sel; fi
+    picks=$(parse_selection "${sel:-}" "${#RV_WT[@]}")
+    if [ -z "$picks" ]; then echo "  nothing selected."; else
+      backed_idx=()
+      while IFS= read -r idx; do
+        [ -z "$idx" ] && continue
+        printf '  backing up %s … ' "${RV_WT[$idx]/#$HOME/~}"
+        res=$(backup_one "$idx")
+        if [ "${res%% *}" = OK ]; then echo "${grn}done${rst} -> ${res#OK }"; backed_idx+=("$idx")
+        else echo "${ylw}FAILED — not pruning this one${rst}"; fi
+      done <<< "$picks"
+      echo "Backups + manifest in: ${BACKUP_DIR/#$HOME/~}/manifest.tsv"
+      if [ "$PRUNE" = 1 ] && [ "${#backed_idx[@]}" -gt 0 ]; then
+        echo "Pruning ${#backed_idx[@]} backed-up worktree(s):"
+        for idx in "${backed_idx[@]}"; do
+          git -C "${RV_REPO[$idx]}" worktree remove --force "${RV_WT[$idx]}" 2>/dev/null \
+            && echo "  removed ${RV_WT[$idx]/#$HOME/~}" \
+            || echo "  ${ylw}skipped${rst} (git refused) ${RV_WT[$idx]/#$HOME/~}"
+        done
+        for MAIN in "${mains[@]}"; do git -C "$MAIN" worktree prune 2>/dev/null; done
+      fi
+    fi
+  fi
+fi

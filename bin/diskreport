@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# diskreport — "where is my disk going?" for an agent-heavy dev Mac.
+# Read-only. Surfaces the top consumers plus the specific dirs that balloon
+# during agent runs, so the answer is never "I don't know what's using it."
+
+set -uo pipefail
+AS="$HOME/Library/Application Support"
+
+hr() { printf '%s\n' "──────────────────────────────────────────────"; }
+section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+section "Volume"
+df -h /System/Volumes/Data | awk 'NR==1 || /disk/'
+snaps=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c com.apple)
+echo "APFS local snapshots: ${snaps:-0}   (nonzero => 'invisible' disk; thin with: tmutil thinlocalsnapshots / )"
+
+section "Top app state — ~/Library/Application Support"
+du -h -d1 "$AS" 2>/dev/null | sort -rh | grep -v "	$AS\$" | head -10
+
+section "Top caches — ~/Library/Caches"
+du -h -d1 "$HOME/Library/Caches" 2>/dev/null | sort -rh | grep -v "Caches\$" | head -8
+
+section "Dev / agent caches (these regrow — 'mac-reclaim' clears them)"
+du -sh "$HOME/.npm" "$HOME/Library/pnpm" "$HOME/.cache" "$HOME/.bun" 2>/dev/null | sort -rh
+
+section "REVIEW tier — big, but real state (prune via 'mac-reclaim --deep')"
+for p in \
+  "$AS/Code/User/workspaceStorage" \
+  "$AS/Claude/vm_bundles" \
+  "$AS/Claude/local-agent-mode-sessions" \
+  "$HOME/.claude/projects" ; do
+  [ -d "$p" ] && printf '  %-6s  %s\n' "$(du -sh "$p" 2>/dev/null | cut -f1)" "${p/#$HOME/~}"
+done
+
+section "Recent reclaims"
+tail -n 5 "$HOME/Library/Logs/mac-reclaim.log" 2>/dev/null || echo "  (none yet — run 'mac-reclaim')"
+hr
