@@ -11,7 +11,7 @@ for label in com.mac-optimize.diskguard com.mac-optimize.mac-reclaim; do
   echo "removed agent  $label"
 done
 
-for s in mac-reclaim diskreport worktree-audit diskguard; do
+for s in mac-reclaim diskreport worktree-audit diskguard mac-optimize-doctor; do
   rm -f "$HOME/.local/bin/$s"
   echo "removed script $HOME/.local/bin/$s"
 done

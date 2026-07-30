@@ -1,7 +1,11 @@
-.PHONY: install uninstall install-skills report audit reclaim lint
+.PHONY: install uninstall install-skills doctor report audit reclaim lint
 
 install:
 	./install.sh
+
+# Verify the install: tools on PATH, launchd agents loaded, skills (optional).
+doctor:
+	@bin/mac-optimize-doctor
 
 # Activate the agent-agnostic skills for Claude Code by symlinking each skill
 # folder into ~/.claude/skills. Other agents can point directly at ./skills.
