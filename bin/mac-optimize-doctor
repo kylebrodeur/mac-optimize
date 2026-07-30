@@ -30,14 +30,17 @@ done
   || info "diskguard hasn't run yet — it fires at login and every 3 h"
 
 hdr "Agent skills (optional)"
-if command -v npx >/dev/null 2>&1; then
-  if npx --yes skills list 2>/dev/null | grep -q 'mac-optimize'; then
-    ok "mac-optimize skills installed (via 'npx skills list')"
+# A health check must never fetch-and-execute a remote CLI. If the `skills` tool
+# is already installed locally (a deliberate, trusted install) use it; otherwise
+# just print the command for the human to run consciously — don't auto-download.
+if command -v skills >/dev/null 2>&1; then
+  if skills list 2>/dev/null | grep -q 'mac-optimize'; then
+    ok "mac-optimize skills installed ('skills list')"
   else
     info "skills not installed — run: npx skills add kylebrodeur/mac-optimize"
   fi
 else
-  info "npx unavailable — skipping skills check (npx skills add kylebrodeur/mac-optimize)"
+  info "to check skills across agents run: npx skills list  (fetches the 'skills' CLI on first use)"
 fi
 
 printf "\n\033[1mmac-optimize: %d passed, %d failed\033[0m\n" "$pass" "$fail"
