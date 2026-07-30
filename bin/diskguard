@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# diskguard — proactive low-disk watcher for an agent-heavy Mac.
+# Meant to be run by launchd on an interval (see com.mac-optimize.diskguard.plist).
+#
+# The "earlyoom" analog from the WSL2 writeup: act at a THRESHOLD, before the
+# wall, and TELL the user what happened — turn a silent hard-fill into an
+# observable, self-healing event. Only ever runs mac-reclaim's SAFE tier
+# unattended; deep/destructive prunes are left for the human to run by hand.
+#
+# Env thresholds (GB of free space on the Data volume):
+#   WARN_GB=20   below this -> run safe reclaim + notify
+#   CRIT_GB=10   still below this after reclaim -> urgent notify, no auto-delete
+
+# launchd gives a near-empty environment; bake in the dirs the tools live in so
+# mac-reclaim's `command -v pnpm/uv/brew` guards resolve. Covers Apple Silicon
+# (/opt/homebrew) and Intel (/usr/local) Homebrew; missing tools are skipped.
+export PATH="$HOME/.local/bin:$HOME/Library/pnpm:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+set -uo pipefail
+DATA_VOL="/System/Volumes/Data"
+WARN_GB="${WARN_GB:-20}"
+CRIT_GB="${CRIT_GB:-10}"
+LOG="$HOME/Library/Logs/diskguard.log"
+mkdir -p "$(dirname "$LOG")"
+
+free_gb() { df -k "$DATA_VOL" | awk 'NR==2{printf "%d", $4/1024/1024}'; }
+logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
+notify()  {  # $1=title  $2=message ; non-blocking, never a modal dialog
+  [ -x /usr/bin/osascript ] || return 0
+  /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
+}
+
+BEFORE=$(free_gb)
+
+if [ "$BEFORE" -ge "$WARN_GB" ]; then
+  logline "ok: ${BEFORE}GB free (>= WARN ${WARN_GB}GB), no action"
+else
+  logline "low: ${BEFORE}GB free (< WARN ${WARN_GB}GB) -> safe reclaim"
+  # SAFE tier only — never --deep unattended.
+  if command -v mac-reclaim >/dev/null 2>&1; then mac-reclaim --quiet >>"$LOG" 2>&1
+  else "$HOME/.local/bin/mac-reclaim" --quiet >>"$LOG" 2>&1; fi
+  AFTER=$(free_gb)
+  RECLAIMED_MB=$(( (AFTER - BEFORE) * 1024 ))
+  logline "reclaim done: ${BEFORE}GB -> ${AFTER}GB (~${RECLAIMED_MB}MB)"
+  notify "diskguard: reclaimed space" "Was ${BEFORE}GB free, now ${AFTER}GB (~${RECLAIMED_MB}MB). Threshold ${WARN_GB}GB."
+  if [ "$AFTER" -lt "$CRIT_GB" ]; then
+    logline "CRITICAL: ${AFTER}GB free (< CRIT ${CRIT_GB}GB) after reclaim"
+    notify "diskguard: still critically low (${AFTER}GB)" \
+      "Safe reclaim wasn't enough. Run in Terminal: diskreport, then mac-reclaim --deep --dry-run, then worktree-audit."
+  fi
+fi
+
+# self-cap this log (the journald lesson)
+[ -f "$LOG" ] && { tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }
+exit 0
