@@ -35,7 +35,7 @@ worktree-audit        # find stray git worktrees
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes stale agent state only with *evidence* it's unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. |
 | **`worktree-audit`** | Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
-| **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH, the launchd agents are loaded + valid, and — via `npx skills list` — whether the skills are installed. Exits non-zero on any failure. |
+| **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
 
 ## How it works
 
