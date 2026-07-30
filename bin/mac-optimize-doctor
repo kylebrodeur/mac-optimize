@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# mac-optimize-doctor — verify a mac-optimize install: the tools are on PATH and
+# the launchd automation is loaded and valid. Read-only. Exits non-zero if
+# anything is off, so it's safe to use in a check or CI step.
+
+pass=0; fail=0
+ok(){ printf "  \033[32m✓\033[0m %s\n" "$1"; pass=$((pass+1)); }
+no(){ printf "  \033[31m✗\033[0m %s\n" "$1"; fail=$((fail+1)); }
+info(){ printf "  \033[2m·\033[0m %s\n" "$1"; }
+hdr(){ printf "\n\033[1m%s\033[0m\n" "$1"; }
+
+uid="$(id -u)"
+
+hdr "Tools on PATH"
+for t in diskreport mac-reclaim worktree-audit diskguard; do
+  p="$(command -v "$t" 2>/dev/null)"
+  { [ -n "$p" ] && [ -x "$p" ]; } && ok "$t → $p" || no "$t not found on PATH — run 'make install' (and ensure ~/.local/bin is on PATH)"
+done
+
+hdr "launchd automation"
+for l in diskguard mac-reclaim; do
+  launchctl print "gui/$uid/com.mac-optimize.$l" >/dev/null 2>&1 \
+    && ok "com.mac-optimize.$l loaded" || no "com.mac-optimize.$l NOT loaded — run 'make install'"
+  pl="$HOME/Library/LaunchAgents/com.mac-optimize.$l.plist"
+  { [ -f "$pl" ] && plutil -lint "$pl" >/dev/null 2>&1 && ! grep -q '__HOME__\|__PATH__' "$pl"; } \
+    && ok "$l plist valid + fully substituted" || no "$l plist missing/invalid/unsubstituted — run 'make install'"
+done
+[ -f "$HOME/Library/Logs/diskguard.log" ] \
+  && ok "diskguard has run (log present)" \
+  || info "diskguard hasn't run yet — it fires at login and every 3 h"
+
+hdr "Agent skills (optional)"
+if command -v npx >/dev/null 2>&1; then
+  if npx --yes skills list 2>/dev/null | grep -q 'mac-optimize'; then
+    ok "mac-optimize skills installed (via 'npx skills list')"
+  else
+    info "skills not installed — run: npx skills add kylebrodeur/mac-optimize"
+  fi
+else
+  info "npx unavailable — skipping skills check (npx skills add kylebrodeur/mac-optimize)"
+fi
+
+printf "\n\033[1mmac-optimize: %d passed, %d failed\033[0m\n" "$pass" "$fail"
+[ "$fail" -eq 0 ]
