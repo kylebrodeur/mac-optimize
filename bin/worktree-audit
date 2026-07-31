@@ -115,8 +115,12 @@ for MAIN in "${mains[@]}"; do
       if [ -n "$ref" ]; then
         # Commits reachable from THIS worktree but from no OTHER ref => removal
         # loses them. Zero => preserved elsewhere (merged/tagged/pushed).
-        exclude=$(exclude_refs "$MAIN" "$BR")
-        unique=$(git -C "$MAIN" rev-list "$ref" --not $exclude 2>/dev/null | wc -l | tr -d ' ')
+        # Array, not an unquoted string: zsh does not word-split unquoted
+        # expansions, so `--not $exclude` reaches git as ONE argument there and
+        # silently returns 0 unique commits — i.e. "safe to delete". Arrays
+        # behave identically in both shells.
+        exclude_arr=(); while IFS= read -r _r; do [ -n "$_r" ] && exclude_arr+=("$_r"); done < <(exclude_refs "$MAIN" "$BR")
+        unique=$(git -C "$MAIN" rev-list "$ref" --not "${exclude_arr[@]}" 2>/dev/null | wc -l | tr -d ' ')
       fi
       idle=$(am_idle_days "$WT")
       size=$(du -sh "$WT" 2>/dev/null | cut -f1)
@@ -164,7 +168,7 @@ parse_selection() {  # $1=sel  $2=count ; prints 0-based indices, deduped/sorted
 backup_one() {  # $1=index
   local i="$1"
   local WT="${RV_WT[$i]}" MAIN="${RV_REPO[$i]}" BR="${RV_BR[$i]}" ref="${RV_REF[$i]}" dirty="${RV_DIRTY[$i]}"
-  local repo_base br_slug bundle_ref restore_ref ts stem out exclude unt
+  local repo_base br_slug bundle_ref restore_ref ts stem out unt
   repo_base=$(basename "$MAIN")
   if [ "$BR" = "(detached)" ] || [ -z "$BR" ]; then
     br_slug="detached-${ref:0:8}"; bundle_ref="$ref"; restore_ref="$ref"       # restore by sha
@@ -175,10 +179,10 @@ backup_one() {  # $1=index
   ts=$(date +%Y%m%d-%H%M%S)
   mkdir -p "$BACKUP_DIR"
   stem="$BACKUP_DIR/${repo_base}__${br_slug}__${ts}"; out="$stem.bundle"
-  exclude=$(exclude_refs "$MAIN" "$BR")
+  exclude_arr=(); while IFS= read -r _r; do [ -n "$_r" ] && exclude_arr+=("$_r"); done < <(exclude_refs "$MAIN" "$BR")
   # Incremental bundle: only commits unique to this worktree (prereqs = the base
   # that survives in MAIN). Empty range would fail — fall back to full ref.
-  if ! git -C "$MAIN" bundle create "$out" "$bundle_ref" --not $exclude >/dev/null 2>&1; then
+  if ! git -C "$MAIN" bundle create "$out" "$bundle_ref" --not "${exclude_arr[@]}" >/dev/null 2>&1; then
     git -C "$MAIN" bundle create "$out" "$bundle_ref" >/dev/null 2>&1 || { echo "FAIL"; return; }
   fi
   git -C "$MAIN" bundle verify "$out" >/dev/null 2>&1 || { echo "FAIL"; return; }
