@@ -12,6 +12,14 @@ Record results as you go; the last section is a copy-paste template.
 
 ---
 
+> **Shell note.** Every tool here runs under `#!/usr/bin/env bash`. If your login
+> shell is zsh, run any hand-verification snippet as `bash -c '...'` — zsh does
+> **not** word-split unquoted expansions, so an inline zsh re-check of a bash
+> script can return the opposite answer with no error. `lib/common.sh` is safe to
+> source from either shell; `bin/worktree-audit` uses `${BASH_SOURCE[0]}` and must
+> be *executed*, not sourced from zsh.
+
+
 ## 0. Prerequisites
 
 ```bash
@@ -199,7 +207,11 @@ another ref) or REVIEW. Verify one SAFE classification by hand before pruning:
 
 ```bash
 # for a repo it called SAFE, confirm the branch's commits exist elsewhere
-git -C <repo> log --oneline <branch> --not $(git -C <repo> for-each-ref --format='%(refname)' refs/heads refs/tags refs/remotes | grep -vxF refs/heads/<branch>) | wc -l
+# NOTE: run via bash -c — this relies on word-splitting, which zsh does not do.
+bash -c 'R=<repo>; B=<branch>
+  ex=(); while IFS= read -r r; do ex+=("$r"); done < <(
+    git -C "$R" for-each-ref --format="%(refname)" refs/heads refs/tags refs/remotes | grep -vxF "refs/heads/$B")
+  git -C "$R" rev-list "refs/heads/$B" --not "${ex[@]}" | wc -l
 ```
 
 **Expect:** `0` — no unique commits. **STOP if** non-zero for a SAFE row.
