@@ -12,6 +12,27 @@ It's a macOS port of a WSL2 optimization writeup. On WSL2 the failure mode was s
 
 The design goal, borrowed from that writeup, is to **change the shape of the failure**: from "silent and fatal" to "observable and bounded." You get a report you can read, a reclaim that's safe by construction, and a watcher that acts at a threshold and tells you what it did.
 
+## Install
+
+**Homebrew** (macOS):
+
+```bash
+brew install kylebrodeur/tap/mac-optimize
+```
+
+Homebrew installs the tools and the shared library, but does **not** manage the
+scheduled automation (it needs per-user paths). `brew info mac-optimize` prints the exact
+commands, or use the clone method below to have `install.sh` do it.
+
+**From a clone** — also sets up the automation:
+
+```bash
+git clone https://github.com/kylebrodeur/mac-optimize.git
+cd mac-optimize
+make install
+make doctor
+```
+
 ## Quickstart
 
 ```bash
