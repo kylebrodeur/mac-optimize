@@ -23,6 +23,12 @@ for f in "$REPO"/bin/*; do
   echo "  $(basename "$f")"
 done
 
+LIBDIR="$HOME/.local/lib/mac-optimize"
+echo "Installing shared library → $LIBDIR"
+mkdir -p "$LIBDIR"
+install -m 0644 "$REPO/lib/common.sh" "$LIBDIR/common.sh"
+echo "  common.sh (vendored from agent-machine-lib)"
+
 echo "Installing + loading launchd agents → $LADIR"
 for p in "$REPO"/launchd/*.plist; do
   label="$(basename "$p" .plist)"

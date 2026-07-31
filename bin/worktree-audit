@@ -34,7 +34,38 @@ for a in "$@"; do
     *) ROOTS+=("$a") ;;
   esac
 done
-[ "${#ROOTS[@]}" -eq 0 ] && ROOTS=("$HOME/workspace")
+# Shared primitives: portable stat/mtime and platform detection.
+AM_TOOL=worktree-audit
+# Locate lib/common.sh. This tool is vendored into several repos that each
+# install to their own libdir, so probe the known locations rather than assuming
+# one. $AM_LIB overrides everything.
+_am_find_lib() {
+  local self_dir; self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local c
+  for c in "${AM_LIB:-}" \
+           "$self_dir/../lib/common.sh" \
+           "$HOME/.local/lib/agent-machine/common.sh" \
+           "$HOME/.local/lib/wsl-optimize/common.sh" \
+           "$HOME/.local/lib/mac-optimize/common.sh"; do
+    [ -n "$c" ] && [ -r "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+_AM_LIB_PATH="$(_am_find_lib)" || {
+  printf '%s: cannot find lib/common.sh (set $AM_LIB to its path)\n' "${0##*/}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+. "$_AM_LIB_PATH"
+
+
+# Default search root differs by platform convention. Override by passing ROOTs.
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+  for _d in "${WORKTREE_ROOTS:-}" "$HOME/workspace" "$HOME/projects" "$HOME/src" "$HOME/code"; do
+    [ -n "$_d" ] && [ -d "$_d" ] && ROOTS+=("$_d")
+  done
+  [ "${#ROOTS[@]}" -eq 0 ] && ROOTS=("$HOME")
+fi
 BACKUP_DIR="${WORKTREE_BACKUP_DIR:-$HOME/.local/share/worktree-backups}"
 
 bold=$'\033[1m'; grn=$'\033[32m'; ylw=$'\033[33m'; dim=$'\033[2m'; rst=$'\033[0m'
@@ -87,7 +118,7 @@ for MAIN in "${mains[@]}"; do
         exclude=$(exclude_refs "$MAIN" "$BR")
         unique=$(git -C "$MAIN" rev-list "$ref" --not $exclude 2>/dev/null | wc -l | tr -d ' ')
       fi
-      idle=$(( ( $(date +%s) - $(stat -f %m "$WT" 2>/dev/null || echo 0) ) / 86400 ))
+      idle=$(am_idle_days "$WT")
       size=$(du -sh "$WT" 2>/dev/null | cut -f1)
 
       state="clean"; [ "$dirty" = 1 ] && state="DIRTY"
