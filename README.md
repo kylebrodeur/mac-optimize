@@ -151,6 +151,10 @@ npx skills add kylebrodeur/mac-optimize --skill mac-optimize -a claude-code -y  
 
 Or point your agent directly at `skills/`, or (Claude Code) run `make install-skills` to symlink `skills/*` into `~/.claude/skills/`. Validate against the spec with `skills-ref validate ./skills/mac-optimize`.
 
+## Testing
+
+Full clone → install → run → maintain → uninstall verification, with assertions and STOP checks at each step: **[TESTING.md](TESTING.md)**.
+
 ## License
 
 MIT © 2026 Kyle Brodeur
