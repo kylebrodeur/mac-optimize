@@ -1,4 +1,4 @@
-.PHONY: install uninstall install-skills doctor report audit reclaim lint
+.PHONY: install uninstall install-skills doctor report audit reclaim lint vendor-lib
 
 install:
 	./install.sh
@@ -36,3 +36,12 @@ lint:
 	else \
 		echo "shellcheck not installed — skipping (brew install shellcheck)"; \
 	fi
+
+# Refresh the vendored shared library + shared tool from agent-machine-lib.
+# Vendored rather than submoduled because this repo promises zero dependencies.
+vendor-lib:
+	@curl -fsSL https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/main/lib/common.sh \
+		-o lib/common.sh
+	@curl -fsSL https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/main/bin/worktree-audit \
+		-o bin/worktree-audit && chmod +x bin/worktree-audit
+	@echo "refreshed lib/common.sh + bin/worktree-audit from agent-machine-lib@main"

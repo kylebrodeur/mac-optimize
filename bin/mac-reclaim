@@ -28,6 +28,28 @@ DATA_VOL="/System/Volumes/Data"
 LOG="$HOME/Library/Logs/mac-reclaim.log"
 AS="$HOME/Library/Application Support"
 KEEPFILE="$HOME/.config/mac-reclaim/keep.txt"
+AM_TOOL=mac-reclaim
+# Locate lib/common.sh. This tool is vendored into several repos that each
+# install to their own libdir, so probe the known locations rather than assuming
+# one. $AM_LIB overrides everything.
+_am_find_lib() {
+  local self_dir; self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local c
+  for c in "${AM_LIB:-}" \
+           "$self_dir/../lib/common.sh" \
+           "$HOME/.local/lib/agent-machine/common.sh" \
+           "$HOME/.local/lib/mac-optimize/common.sh"; do
+    [ -n "$c" ] && [ -r "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+_AM_LIB_PATH="$(_am_find_lib)" || {
+  printf '%s: cannot find lib/common.sh (set $AM_LIB to its path)\n' "${0##*/}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+. "$_AM_LIB_PATH"
+
 KEEP_DAYS="${KEEP_DAYS:-30}"
 KEEP_RECENT="${KEEP_RECENT:-5}"
 DEEP=0; ASSUME_YES=0; QUIET=0; DRYRUN=0
@@ -84,12 +106,18 @@ START_KB=$(avail_kb)
 say "mac-reclaim: safe caches…"
 
 # ---------- SAFE TIER (safe by construction) ----------
+# Package-manager caches behave identically on macOS and WSL2, so they live in
+# agent-machine-lib and are shared with wsl-optimize. Unlike the old inline
+# block, the shared helper honours --dry-run and reports what it WOULD do
+# instead of skipping the tier silently.
+emit(){ case "$1" in ACTION) say "  → $2" ;; *) say "  · $2" ;; esac; }
+am_reclaim_caches "$([ "$DRYRUN" = 1 ] && echo 1 || echo 0)" emit
+
+# macOS-only tail: no WSL analogue, so it stays here.
 if [ "$DRYRUN" != 1 ]; then
+  # _cacache is also GC'd by `npm cache verify` in the shared tier; scrubbing it
+  # outright is kept because it reclaims more and it is only a re-download cache.
   scrub "$HOME/.npm/_cacache" "$HOME/.npm/_npx"
-  command -v pnpm >/dev/null 2>&1 && pnpm store prune >/dev/null 2>&1
-  command -v uv   >/dev/null 2>&1 && uv cache prune  >/dev/null 2>&1
-  command -v brew >/dev/null 2>&1 && brew cleanup -s >/dev/null 2>&1
-  command -v bun  >/dev/null 2>&1 && bun pm cache rm >/dev/null 2>&1
   scrub "$HOME/.cache/codex-runtimes" "$HOME/.cache/node"
   scrub "$HOME"/Library/Caches/*.ShipIt
   scrub "$AS/Code/CachedExtensionVSIXs" "$AS/Code/Cache" "$AS/Code/CachedData" "$AS/Code/Crashpad"
@@ -97,7 +125,7 @@ if [ "$DRYRUN" != 1 ]; then
     [ -d "$HOME/Library/Logs/$d" ] && find "$HOME/Library/Logs/$d" -type f -delete 2>/dev/null
   done
 else
-  say "  (dry-run: safe tier skipped; showing deep candidates only)"
+  say "  (dry-run: macOS-specific scrubs skipped; shared tier shown above)"
 fi
 
 # ---------- DEEP TIER (evidence-based) ----------
@@ -119,7 +147,18 @@ if [ "$DEEP" = 1 ]; then
   fi
 
   # Idle-based: vm_bundles, agent sessions, .claude projects — keep newest N, age-gate rest.
-  for base in "$AS/Claude/vm_bundles" "$AS/Claude/local-agent-mode-sessions" "$HOME/.claude/projects"; do
+  # agent-session-kill handles agent transcripts better than this loop can:
+  # trash-first deletion, protection lists for auth/settings/skills/memory, and
+  # coverage of Pi/OMP/Copilot Chat. Defer .claude/projects to it when present;
+  # vm_bundles and local-agent-mode-sessions have no equivalent there, so they
+  # stay handled locally either way.
+  _bases=("$AS/Claude/vm_bundles" "$AS/Claude/local-agent-mode-sessions")
+  if am_have_agent_session_kill; then
+    say "  · agent transcripts: delegating ~/.claude/projects to agent-session-kill"
+  else
+    _bases+=("$HOME/.claude/projects")
+  fi
+  for base in "${_bases[@]}"; do
     [ -d "$base" ] || continue
     # newest-first by mtime; skip the first KEEP_RECENT, consider the rest.
     idx=0

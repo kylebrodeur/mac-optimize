@@ -19,3 +19,5 @@ done
 echo
 echo "Done. Repo left intact."
 echo "Optional: rm -f ~/Library/Logs/diskguard*.log ~/Library/Logs/mac-reclaim*.log"
+
+rm -rf "$HOME/.local/lib/mac-optimize" 2>/dev/null && echo "  shared library"

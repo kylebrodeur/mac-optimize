@@ -33,7 +33,7 @@ worktree-audit        # find stray git worktrees
 |------|--------------|
 | **`diskreport`** | Read-only "where did my disk go?" — top consumers in `Application Support`, `Caches`, and dev/agent caches, plus the big "review-tier" state (VS Code `workspaceStorage`, Claude `vm_bundles`, `.claude/projects`) and recent reclaim history. Deletes nothing. |
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes stale agent state only with *evidence* it's unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. |
-| **`worktree-audit`** | Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
+| **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
 | **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
 
@@ -103,9 +103,19 @@ git apply <stem>.uncommitted.patch
 tar xzf <stem>.untracked.tar.gz -C <worktree>
 ```
 
+## Related tools
+
+These solve adjacent problems well; this repo defers to them rather than shipping weaker copies.
+
+| Tool | Why |
+|---|---|
+| [`wsl-optimize`](https://github.com/kylebrodeur/wsl-optimize) | The WSL2 sibling. On WSL the silent killer is memory (the OOM killer reaps session plumbing while protecting the hogs) *plus* a virtual disk that only grows. Shares `worktree-audit` and `lib/common.sh` with this repo. |
+| [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) | The shared bash primitives both repos vendor: platform detection, deletion guards, and the safe-tier cache reclaim. Refresh with `make vendor-lib`. |
+| [`agent-session-kill`](https://github.com/kylebrodeur/agent-session-kill) | Agent transcript cleanup done properly: trash-first deletion, protection lists for auth/settings/skills/memory, and coverage of Pi/OMP/Copilot Chat. `mac-reclaim --deep` **delegates `~/.claude/projects` to it when installed** and only falls back to its own pruning otherwise. |
+
 ## Requirements
 
-macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each tool is guarded by `command -v`).
+macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. The safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each tool is guarded by `command -v`).
 
 ## Automation & uninstall
 
