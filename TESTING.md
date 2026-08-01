@@ -198,9 +198,11 @@ First verify the `agent-session-kill` delegation logic with a disposable home so
 the check does not scan live agent state:
 
 ```bash
-set -o pipefail
+(
+set -euo pipefail
 fake_home=$(mktemp -d /tmp/mac-reclaim-delegation.XXXXXX)
-trap 'rm -rf "$fake_home"' EXIT
+shim=
+trap 'rm -rf "$fake_home" "${shim:-}"' EXIT
 mkdir -p "$fake_home/.claude/projects"/{old1,old2}
 mkdir -p "$fake_home/Library/Application Support/Claude/vm_bundles"/{old1,old2}
 mkdir -p "$fake_home/Library/Application Support/Claude/local-agent-mode-sessions"/{old1,old2}
@@ -224,6 +226,7 @@ grep -qF 'delegating ~/.claude/projects to agent-session-kill' /tmp/mac-reclaim-
 ! grep -qF '~/.claude/projects/old' /tmp/mac-reclaim-with-session-kill.txt
 grep -qF '~/Library/Application Support/Claude/vm_bundles/old' /tmp/mac-reclaim-with-session-kill.txt
 grep -qF '~/Library/Application Support/Claude/local-agent-mode-sessions/old' /tmp/mac-reclaim-with-session-kill.txt
+)
 ```
 
 Then review the live 4b candidate list and agree with every reason:
@@ -248,12 +251,12 @@ worktree-audit --prune              # remove SAFE ones
 another ref) or REVIEW. Verify one SAFE classification by hand before pruning:
 
 ```bash
-# for a repo it called SAFE, confirm the branch's commits exist elsewhere
-# NOTE: run via bash -c — this relies on word-splitting, which zsh does not do.
-bash -c 'R=<repo>; B=<branch>
+# For a repo it called SAFE, replace R and B, then confirm the branch's commits
+# exist elsewhere. NOTE: run via bash -c — this relies on bash arrays.
+bash -c 'R=/absolute/path/to/repo; B=branch-name
   ex=(); while IFS= read -r r; do ex+=("$r"); done < <(
     git -C "$R" for-each-ref --format="%(refname)" refs/heads refs/tags refs/remotes | grep -vxF "refs/heads/$B")
-  git -C "$R" rev-list "refs/heads/$B" --not "${ex[@]}" | wc -l
+  git -C "$R" rev-list "refs/heads/$B" --not "${ex[@]}" | wc -l'
 ```
 
 **Expect:** `0` — no unique commits. **STOP if** non-zero for a SAFE row.
@@ -283,7 +286,7 @@ WORKTREE_ROOTS=/tmp/definitely-missing-worktree-root ./bin/worktree-audit /tmp
 ```bash
 make doctor          # expect 0 failed
 make vendor-lib      # refresh the shared library + worktree-audit
-git diff --stat      # shows drift, if any, from agent-machine-lib@main
+git diff --stat      # shows vendored drift, if any, from the resolved upstream SHA
 ```
 
 If `vendor-lib` produces a diff, re-run the section 2 library checks before committing.
@@ -413,6 +416,15 @@ Anything unexpected:
 - A later deep dry-run attempt hung in the candidate scan and was killed (`bash ./bin/mac-reclaim --deep --dry-run`, pid 43932). Do not treat §4b delta verification as clean until rerun after `diskguard` is idle and the scan completes.
 - `WORKTREE_ROOTS="$HOME/some/other/dir" worktree-audit` previously looked like it worked while still scanning defaults. The fixed behavior now treats `WORKTREE_ROOTS` as the constrained scan root.
 - Historical `diskguard.log` tail includes older `rm: ... .npm/_cacache ... Directory not empty` lines from 2026-07-30, before this verification run.
+- Operational stability note for gist/writeup: user-observed outcome during this
+  macOS run was no significant crash, out-of-memory incident, or Force Quit “apps
+  paused” event. Telemetry snapshot at 20:58 covered a machine up for `1 day,
+  6:19` since `Thu Jul 30 14:39:11 2026`: `memory_pressure -Q` reported `46%`
+  system-wide memory free; `sysctl vm.swapusage` reported `5120.00M` total swap
+  with `4721.75M` used; DiagnosticReports files modified in the last six hours
+  counted `0` crash/IPS, `0` panic-named, and `0` hang/spin-named reports. A
+  six-hour unified-log scan still showed RunningBoard/memorystatus bookkeeping
+  messages, and macOS log retention/filtering is not a complete absence proof.
 ```
 
 ### Remaining manual checks from 2026-07-31
@@ -421,7 +433,8 @@ The first macOS pass intentionally did not run destructive or interactive cleanu
 against Kyle's live state. To finish the remaining review safely:
 
 ```bash
-set -o pipefail
+(
+set -euo pipefail
 # 1. Ensure the RunAtLoad diskguard job is idle before measuring a dry-run delta.
 while launchctl list | awk '/com\.mac-optimize\.diskguard/ && $1 != "-" {found=1} END{exit !found}'; do
   echo "waiting for diskguard to finish…"
@@ -441,6 +454,7 @@ mac-reclaim --deep
 worktree-audit
 worktree-audit --backup     # only if REVIEW rows should be archived
 worktree-audit --prune      # only if SAFE rows should be removed
+)
 ```
 
 Do **not** run `mac-reclaim --deep --yes` or `worktree-audit --backup --prune --yes`
