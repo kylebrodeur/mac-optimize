@@ -196,13 +196,90 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
     )
 
 
+def _ensure_private_parent(path: Path) -> None:
+    """Ensure the parent directory exists as a real directory with no group/other access.
+
+    Walks upward from the requested parent to the nearest existing ancestor (following
+    symlinks for that trusted/system ancestor), creates the missing suffix components
+    under the resolved ancestor with umask 0o077, and validates the final parent is a
+    real directory owned by the current user with mode 0700.
+    """
+    parent = Path(path).parent
+
+    # Find the nearest existing ancestor, collecting the missing suffix names.
+    missing = []
+    current = parent
+    while True:
+        try:
+            st = os.stat(current)
+        except FileNotFoundError:
+            missing.append(current.name)
+            parent_parent = current.parent
+            if parent_parent == current:
+                raise ManifestError(f"atomic_json_write: no existing ancestor for {parent}")
+            current = parent_parent
+            continue
+        except OSError as e:
+            raise ManifestError(f"atomic_json_write: cannot stat {current}: {e}")
+        if not stat.S_ISDIR(st.st_mode):
+            raise ManifestError(f"atomic_json_write: existing ancestor is not a directory: {current}")
+        break
+
+    # Resolve the existing ancestor once; create missing components beneath it.
+    real_parent = Path(os.path.realpath(current))
+    old_umask = os.umask(0o077)
+    try:
+        for name in reversed(missing):
+            real_parent = real_parent / name
+            try:
+                os.mkdir(real_parent, 0o700)
+            except FileExistsError:
+                # A concurrent creator won the race; validate the winner no-follow.
+                try:
+                    st = os.lstat(real_parent)
+                except OSError as e:
+                    raise ManifestError(
+                        f"atomic_json_write: cannot lstat concurrent directory {real_parent}: {e}"
+                    )
+                if not stat.S_ISDIR(st.st_mode):
+                    raise ManifestError(
+                        f"atomic_json_write: concurrent path is not a directory: {real_parent}"
+                    )
+            except OSError as e:
+                raise ManifestError(f"atomic_json_write: cannot create directory {real_parent}: {e}")
+    finally:
+        os.umask(old_umask)
+
+    _validate_private_dir(real_parent, "parent directory")
+    # Explicitly chmod in case a concurrent change relaxed the mode.
+    try:
+        os.chmod(real_parent, 0o700)
+    except OSError as e:
+        raise ManifestError(f"atomic_json_write: cannot chmod parent directory {real_parent}: {e}")
+    return real_parent
+
+
+def _validate_private_dir(path: Path, context: str) -> None:
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        raise ManifestError(f"atomic_json_write: cannot lstat {context} {path}: {e}")
+    if not stat.S_ISDIR(st.st_mode):
+        raise ManifestError(f"atomic_json_write: {context} is not a directory: {path}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise ManifestError(f"atomic_json_write: {context} is too permissive: {path}")
+    if st.st_uid != os.getuid():
+        raise ManifestError(f"atomic_json_write: {context} not owned by user: {path}")
+
+
 def atomic_json_write(path: Path, value: dict) -> None:
     """Write JSON atomically with mode 0600 and durable rename."""
     import tempfile
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = _ensure_private_parent(p)
+    resolved_path = resolved_parent / p.name
     fd, tmp_name = tempfile.mkstemp(
-        dir=p.parent,
+        dir=resolved_parent,
         prefix=f".{p.name}.tmp.",
         suffix=f".{os.getpid()}.{time.time_ns()}",
     )
@@ -213,17 +290,17 @@ def atomic_json_write(path: Path, value: dict) -> None:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, p)
+        os.replace(tmp_name, resolved_path)
         # Make the rename durable by fsyncing the parent directory.
         try:
-            dir_fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            dir_fd = os.open(resolved_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
         except OSError as e:
             raise ManifestError(
-                f"atomic_json_write: cannot fsync parent directory {p.parent}: {e}"
+                f"atomic_json_write: cannot fsync parent directory {resolved_parent}: {e}"
             )
     except Exception:
         try:
@@ -286,11 +363,11 @@ def _validate_pointer_state_evidence(data):
     tree_fp = data.get("tree_fingerprint")
 
     _validate_error_field(data.get("error"), "error")
-    if state in ("verify-failed", "restore-failed"):
+    if state == "verify-failed":
         if data.get("error") is None:
-            raise ManifestError(f"state {state} requires an error object")
+            raise ManifestError("state verify-failed requires an error object")
     elif data.get("error") is not None:
-        raise ManifestError(f"state {state} must not carry error evidence")
+        raise ManifestError(f"state {state} must not carry top-level error evidence")
 
     history = data.get("history", [])
     for i, item in enumerate(history):
@@ -305,6 +382,9 @@ def _validate_pointer_state_evidence(data):
     restore = data.get("restore")
     pruned = data.get("pruned")
 
+    if isinstance(restore, dict):
+        _validate_error_field(restore.get("error"), "restore.error")
+
     if state in ("restored", "pruned"):
         if not isinstance(restore, dict):
             raise ManifestError(f"state {state} requires a restore object")
@@ -316,7 +396,12 @@ def _validate_pointer_state_evidence(data):
             raise ManifestError("restore.destination must be an absolute path")
         if not _iso_ok(restore.get("restored_at", "")):
             raise ManifestError("restore.restored_at must be ISO 8601 UTC")
-        _validate_error_field(restore.get("error"), "restore.error")
+
+    if state == "restore-failed":
+        if not isinstance(restore, dict):
+            raise ManifestError("state restore-failed requires a restore object")
+        if restore.get("error") is None:
+            raise ManifestError("state restore-failed requires restore.error")
 
     if state == "pruned":
         if not isinstance(pruned, dict):

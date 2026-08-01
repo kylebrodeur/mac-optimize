@@ -180,7 +180,7 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # ── atomic JSON write mode 0600 ─────────────────────────────────────────────
 JSON_DIR="$TMP_HOME/json-write"
-mkdir -p "$JSON_DIR"
+mkdir -m 700 -p "$JSON_DIR"
 JSON_PATH="$JSON_DIR/manifest.json"
 "$CLI" atomic-json-write "$JSON_PATH" '{"$schema":"vscode-chat-backup-manifest-v1","version":1}'
 PERM=$(stat -c '%a' "$JSON_PATH" 2>/dev/null || stat -f '%Lp' "$JSON_PATH")
@@ -194,6 +194,50 @@ UMASK_PERM=$(
   stat -c '%a' "$UMASK_PATH" 2>/dev/null || stat -f '%Lp' "$UMASK_PATH"
 )
 expect_eq "$UMASK_PERM" "600" "atomic_json_write ignores umask and creates mode 0600"
+
+# First-run nested manifest path under permissive umask must create all parents at 0700.
+FIRST_RUN=$(
+  umask 0000
+  BASE="$TMP_HOME/first-run/nested/manifests"
+  MANIFEST_PATH="$BASE/manifest.json"
+  "$CLI" atomic-json-write "$MANIFEST_PATH" '{"$schema":"vscode-chat-backup-manifest-v1","version":1}' >/dev/null
+  for d in "$TMP_HOME/first-run" "$TMP_HOME/first-run/nested" "$TMP_HOME/first-run/nested/manifests"; do
+    mode=$(stat -c '%a' "$d" 2>/dev/null || stat -f '%Lp' "$d")
+    if [ "$mode" != "700" ]; then
+      echo "bad:$d=$mode"
+      exit 1
+    fi
+  done
+  echo "ok"
+)
+expect_eq "$FIRST_RUN" "ok" "atomic_json_write creates first-run parents mode 0700 under umask 0000"
+
+# Repeated path components must not confuse parent creation.
+REPEATED=$(
+  umask 0000
+  BASE="$TMP_HOME/rep/a/a/a"
+  MANIFEST_PATH="$BASE/manifest.json"
+  "$CLI" atomic-json-write "$MANIFEST_PATH" '{"$schema":"vscode-chat-backup-manifest-v1","version":1}' >/dev/null
+  for d in "$TMP_HOME/rep" "$TMP_HOME/rep/a" "$TMP_HOME/rep/a/a" "$TMP_HOME/rep/a/a/a"; do
+    mode=$(stat -c '%a' "$d" 2>/dev/null || stat -f '%Lp' "$d")
+    if [ "$mode" != "700" ]; then
+      echo "bad:$d=$mode"
+      exit 1
+    fi
+  done
+  echo "ok"
+)
+expect_eq "$REPEATED" "ok" "atomic_json_write creates repeated-component parents mode 0700"
+
+# Pre-existing parent directories that are too permissive must be rejected.
+PERMISSIVE_DIR="$TMP_HOME/permissive-parent"
+mkdir -m 755 -p "$PERMISSIVE_DIR"
+if "$CLI" atomic-json-write "$PERMISSIVE_DIR/manifest.json" '{"$schema":"vscode-chat-backup-manifest-v1","version":1}' >/dev/null 2>&1; then
+  echo "FAIL: atomic_json_write accepted permissive parent directory"
+  fail=1
+else
+  echo "PASS: atomic_json_write rejects permissive parent directory"
+fi
 
 # ── interrupted atomic-write recovery ───────────────────────────────────────
 # Simulate a crash that leaves a partial temp artifact next to a valid target.
@@ -376,6 +420,20 @@ GOOD_HISTORY_ERROR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=j
 printf '%s\n' "$GOOD_HISTORY_ERROR" > "$JSON_DIR/good-history-error.json"
 HISTORY_STATE=$("$CLI" load-pointer-manifest "$JSON_DIR/good-history-error.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["history"][0]["state"])')
 expect_eq "$HISTORY_STATE" "verify-failed" "pointer manifest accepts history entry with valid error"
+
+# restore-failed records the error inside the restore object.
+RESTORE_FAILED=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"restore-failed","restore":{"error":{"message":"restore failed","at":"'"$NOW"'"},"destination":"/tmp/restore"},"pruned":None,"history":[]}); print(json.dumps(d))')
+printf '%s\n' "$RESTORE_FAILED" > "$JSON_DIR/restore-failed.json"
+expect_eq "$("$CLI" load-pointer-manifest "$JSON_DIR/restore-failed.json" | json_field state)" "restore-failed" "pointer manifest accepts restore-failed with restore.error"
+
+NO_RESTORE_ERROR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"restore-failed","restore":{"destination":"/tmp/restore"},"pruned":None,"history":[]}); print(json.dumps(d))')
+printf '%s\n' "$NO_RESTORE_ERROR" > "$JSON_DIR/no-restore-error.json"
+if "$CLI" load-pointer-manifest "$JSON_DIR/no-restore-error.json" >/dev/null 2>&1; then
+  echo "FAIL: pointer manifest accepted restore-failed without restore.error"
+  fail=1
+else
+  echo "PASS: pointer manifest rejects restore-failed without restore.error"
+fi
 
 # ── reconcile pointer ─────────────────────────────────────────────────────────
 P1=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[]}); print(json.dumps(d))')
