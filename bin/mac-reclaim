@@ -6,8 +6,9 @@
 #     logs. Safe *by construction* — pnpm/uv decide what's unreferenced; npm's
 #     _cacache is a redownload cache; node_modules are never touched.
 #   DEEP (--deep): stale agent STATE. Removed only with EVIDENCE it's unused:
-#     - VS Code workspaceStorage: only if its workspace.json points to a folder
-#       that no longer exists (orphan). Alive project => always kept.
+#     - VS Code workspaceStorage: orphaned directories are reported as
+#       review/protected only and never removed until an archive-first backup
+#       exists. Alive project => always kept.
 #     - vm_bundles / agent sessions / .claude projects: only if idle >KEEP_DAYS,
 #       beyond the newest $KEEP_RECENT, not open by any process, not allowlisted.
 #
@@ -132,17 +133,39 @@ fi
 if [ "$DEEP" = 1 ]; then
   say ""; say "Deep tier — proven-unused agent state (KEEP_DAYS=$KEEP_DAYS, keep newest $KEEP_RECENT):"
   DELETE=(); REASON=()
+  REVIEW=(); REVIEW_REASON=()
 
-  add() { DELETE+=("$1"); REASON+=("$2"); }
+  add()        { DELETE+=("$1"); REASON+=("$2"); }
+  add_review() { REVIEW+=("$1"); REVIEW_REASON+=("$2"); }
 
-  # VS Code workspaceStorage: orphan-only (referenced project folder is gone).
+  # Reason for review-only workspaceStorage entries. Never returns the old
+  # deletion reason "orphan: project folder gone".
+  ws_review_reason() {
+    local d="$1"
+    if [ -d "$d/chatSessions" ] || [ -d "$d/ChatSessions" ]; then
+      printf 'review: chat sessions present (archive before removal)\n'
+    elif ls -A "$d" 2>/dev/null | grep -q .; then
+      printf 'review: contents present (archive before removal)\n'
+    else
+      printf 'review: orphan workspaceStorage (archive before removal)\n'
+    fi
+  }
+
+  # VS Code workspaceStorage: orphaned directories are review/protected only
+  # until an archive-first backup exists; they are never deleted here.
   wsroot="$AS/Code/User/workspaceStorage"
   if [ -d "$wsroot" ]; then
     for d in "$wsroot"/*/; do
       d="${d%/}"; [ -d "$d" ] || continue
       is_allowlisted "$d" && continue
       st=$(ws_folder_status "$d")
-      if [ "$st" = orphan ] && ! dir_open "$d"; then add "$d" "orphan: project folder gone"; fi
+      if [ "$st" = orphan ]; then
+        if dir_open "$d"; then
+          add_review "$d" "review: in use/open (archive before removal)"
+        else
+          add_review "$d" "$(ws_review_reason "$d")"
+        fi
+      fi
     done
   fi
 
@@ -173,8 +196,19 @@ if [ "$DEEP" = 1 ]; then
     done < <(ls -dt "$base"/*/ 2>/dev/null | sed 's:/$::')
   done
 
+  if [ "${#REVIEW[@]}" -gt 0 ]; then
+    say "review/protected workspaceStorage (not removed until archived):"
+    for i in "${!REVIEW[@]}"; do
+      printf '  %-7s  %-26s  %s\n' \
+        "$(du -sh "${REVIEW[$i]}" 2>/dev/null | cut -f1)" "${REVIEW_REASON[$i]}" "${REVIEW[$i]/#$HOME/~}"
+    done
+  else
+    say "review/protected workspaceStorage (not removed until archived): none"
+  fi
+
+  say "Deletion candidates:"
   if [ "${#DELETE[@]}" -eq 0 ]; then
-    say "  no candidates — everything is in use, recent, or allowlisted."
+    say "  no deletion candidates."
   else
     for i in "${!DELETE[@]}"; do
       printf '  %-7s  %-26s  %s\n' \

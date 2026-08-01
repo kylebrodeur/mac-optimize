@@ -26,7 +26,7 @@ Allowlist: `~/.config/mac-reclaim/keep.txt` — one path substring per line; any
 
 Safe tier clears: `~/.npm/_cacache` + `_npx`, `pnpm store prune`, `uv cache prune`, `brew cleanup -s`, `bun pm cache rm`, `~/.cache/codex-runtimes`, `~/.cache/node`, `*.ShipIt` updaters, VS Code `CachedExtensionVSIXs`/`Cache`/`CachedData`/`Crashpad`, and stale app logs.
 
-Deep tier candidates (only when idle > `KEEP_DAYS`, beyond newest `KEEP_RECENT`, not open per `lsof`, not allowlisted): VS Code `workspaceStorage` (orphan only — removed only when its `workspace.json` points to a folder that no longer exists), Claude `vm_bundles`, `local-agent-mode-sessions`, `~/.claude/projects`.
+Deep tier: orphaned VS Code `workspaceStorage` is reported as **REVIEW/protected** and is never removed until an archive-first backup and explicit verified prune workflow exists. The only deep-delete candidates (only when idle > `KEEP_DAYS`, beyond newest `KEEP_RECENT`, not open per `lsof`, not allowlisted) are `vm_bundles`, `local-agent-mode-sessions`, and `~/.claude/projects`.
 
 Log: `~/Library/Logs/mac-reclaim.log`, self-capped to the last 500 lines.
 

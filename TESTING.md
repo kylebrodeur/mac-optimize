@@ -194,6 +194,16 @@ Re-running immediately should reclaim ≈0 (idempotent).
 
 ### 4d. Deep tier
 
+**workspaceStorage safety guard.** Orphaned VS Code
+`~/Library/Application Support/Code/User/workspaceStorage` directories are
+classified as REVIEW and are never deletion candidates for `mac-reclaim`.
+Current live evidence found chat-bearing state in these directories, so cleanup
+must be archive-first. Any future pruning workflow for workspaceStorage is gated
+on the backup design spec at
+`docs/superpowers/specs/2026-08-01-vscode-chat-backup-design.md`; implementation
+must pass restore rehearsal, deterministic tree fingerprint, and hostile-archive
+extraction gates before any prune workflow is allowed.
+
 First verify the `agent-session-kill` delegation logic with a disposable home so
 the check does not scan live agent state:
 
@@ -461,6 +471,12 @@ candidate reason is understood and the delta is approximately zero.
 ```bash
 mac-reclaim --deep
 ```
+
+`~/Library/Application Support/Code/User/workspaceStorage` remains
+REVIEW/protected and is never deleted by `mac-reclaim`; see the §4d guard. Any
+future prune workflow for those paths requires the backup spec at
+`docs/superpowers/specs/2026-08-01-vscode-chat-backup-design.md` to pass restore,
+fingerprint, and hostile-archive gates first.
 
 3. Worktree cleanup is separate. Audit first:
 

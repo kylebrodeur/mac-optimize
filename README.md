@@ -53,7 +53,7 @@ worktree-audit        # find stray git worktrees
 | Tool | What it does |
 |------|--------------|
 | **`diskreport`** | Read-only "where did my disk go?" — top consumers in `Application Support`, `Caches`, and dev/agent caches, plus the big "review-tier" state (VS Code `workspaceStorage`, Claude `vm_bundles`, `.claude/projects`) and recent reclaim history. Deletes nothing. |
-| **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes stale agent state only with *evidence* it's unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. |
+| **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only with *evidence* they're unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and never removed until an archive-first backup and explicit verified prune workflow exists. |
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
 | **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
@@ -64,7 +64,7 @@ Four principles, in order of trust:
 
 1. **Observable before action.** `diskreport` answers "what's using my disk" without touching anything. Diagnose first.
 2. **Safe by construction.** The default `mac-reclaim` only clears caches the owning tool rebuilds on demand — `pnpm`/`uv` prune only *unreferenced* packages; npm's `_cacache` is a re-download cache; installed `node_modules` are never touched. It **cannot** remove something you're using.
-3. **Evidence before deletion.** The deep tier and worktree removal require *proof* an item is disposable: workspace state that's orphaned (its project folder is gone) or idle-and-unopened; a worktree whose every commit is reachable from another branch/tag/remote. Anything unproven is **backed up, never deleted.**
+3. **Evidence before deletion.** The deep tier and worktree removal require *proof* an item is disposable: idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects`; a worktree whose every commit is reachable from another branch/tag/remote. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and is **never removed** until an archive-first backup and explicit verified prune workflow exists. Anything unproven is **protected, never deleted.**
 4. **Bounded automation.** `diskguard` runs unattended, but only ever the safe tier, and only at a threshold — turning a silent disk-fill into an observable, self-healing event it logs and notifies about.
 
 ## Options
@@ -97,10 +97,10 @@ Allowlist paths from deep pruning in `~/.config/mac-reclaim/keep.txt` (one subst
 
 ### Why `mac-reclaim --deep` is trustworthy
 
-Age alone is a bad signal (a project you use weekly but not in 30 days shouldn't vanish). `--deep` only removes:
+Age alone is a bad signal (a project you use weekly but not in 30 days shouldn't vanish). `--deep` handles state as follows:
 
-- **VS Code `workspaceStorage`** whose `workspace.json` points to a folder that **no longer exists** (a truly orphaned entry). If the project folder is still there, it's kept regardless of age.
-- **`vm_bundles` / agent sessions / `.claude/projects`** that are idle past `KEEP_DAYS`, beyond the newest `KEEP_RECENT`, not currently open (`lsof`), and not matched by `~/.config/mac-reclaim/keep.txt`.
+- **VS Code `workspaceStorage`** whose `workspace.json` points to a folder that **no longer exists** is reported as **REVIEW/protected**; `mac-reclaim` never removes it until an archive-first backup and explicit verified prune workflow exists. If the project folder is still there, it's kept regardless of age.
+- The only items `--deep` removes are **`vm_bundles` / `local-agent-mode-sessions` / `.claude/projects`** that are idle past `KEEP_DAYS`, beyond the newest `KEEP_RECENT`, not currently open (`lsof`), and not matched by `~/.config/mac-reclaim/keep.txt`.
 
 Preview it first — this deletes nothing: `mac-reclaim --deep --dry-run`.
 

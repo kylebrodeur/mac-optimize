@@ -39,7 +39,7 @@ mac-reclaim --deep --dry-run     # shows every candidate + WHY it's considered u
 mac-reclaim --deep               # prompts before deleting
 ```
 
-The deep tier prunes stale agent state (orphaned VS Code `workspaceStorage`, old `vm_bundles`, aged `.claude/projects`). It is **evidence-based**, guarded by: an `lsof` open-file check (skip anything in use), keep-newest-N, an age gate (`KEEP_DAYS`), and an allowlist at `~/.config/mac-reclaim/keep.txt`. Never run `--deep` unattended or with `--yes` unless the user has reviewed a dry-run.
+The deep tier reports orphaned VS Code `workspaceStorage` as REVIEW/protected and never removes it until an archive-first backup and explicit verified prune workflow exists. It prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only when they're past `KEEP_DAYS`, beyond the newest `KEEP_RECENT`, not open per `lsof`, and not allowlisted. Never run `--deep` unattended or with `--yes` unless the user has reviewed a dry-run.
 
 ## 4. Audit and reclaim git worktrees
 
@@ -60,7 +60,7 @@ Locked worktrees are always skipped. Backups land in `~/.local/share/worktree-ba
 
 ## The rule
 
-Caches are safe-by-construction — clear them. Anything holding potentially-unrecoverable work (REVIEW worktrees, uncommitted changes) is **backed up, never deleted.** When unsure, prefer `diskreport` and dry-runs over action.
+Caches are safe-by-construction — clear them. Anything holding potentially-unrecoverable work is **protected, never deleted**; REVIEW worktrees are archived first so they *become* safe to prune. When unsure, prefer `diskreport` and dry-runs over action.
 
 ## Details
 
