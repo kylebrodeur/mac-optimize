@@ -186,6 +186,15 @@ JSON_PATH="$JSON_DIR/manifest.json"
 PERM=$(stat -c '%a' "$JSON_PATH" 2>/dev/null || stat -f '%Lp' "$JSON_PATH")
 expect_eq "$PERM" "600" "atomic_json_write creates file mode 0600"
 
+# Even with a permissive umask the file must be created mode 0600.
+UMASK_PERM=$(
+  umask 0000
+  UMASK_PATH="$JSON_DIR/umask.json"
+  "$CLI" atomic-json-write "$UMASK_PATH" '{"$schema":"vscode-chat-backup-manifest-v1","version":1}' >/dev/null
+  stat -c '%a' "$UMASK_PATH" 2>/dev/null || stat -f '%Lp' "$UMASK_PATH"
+)
+expect_eq "$UMASK_PERM" "600" "atomic_json_write ignores umask and creates mode 0600"
+
 # ── interrupted atomic-write recovery ───────────────────────────────────────
 # Simulate a crash that leaves a partial temp artifact next to a valid target.
 OLD_VALUE='{"$schema":"vscode-chat-backup-manifest-v1","version":1,"workspace_hash":"'"$VALID_HASH"'","original_workspace_path":"/old/project","source_path":"'"$HOME/Library/Application Support/Code/User/workspaceStorage/$VALID_HASH"'","archive_name":"'"$VALID_HASH"'-sha256:deadbeef.tar.gz.bin","tree_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","archive_sha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","archive_size_bytes":1234,"regular_file_count":2,"regular_bytes":41,"created_at":"'"$NOW"'"}'
@@ -210,6 +219,32 @@ NEW_PERM=$(stat -c '%a' "$JSON_PATH" 2>/dev/null || stat -f '%Lp' "$JSON_PATH")
 expect_eq "$NEW_PERM" "600" "atomic_json_write recovers with target mode 0600"
 expect_eq "$("$CLI" load-sidecar-manifest "$JSON_PATH" | json_field original_workspace_path)" "/new/project" "atomic_json_write replaced target after crash artifact"
 
+# ── atomic write durability instrumentation ─────────────────────────────────
+# Prove via monkeypatched os.fsync that both the temp file and parent directory are fsynced.
+python3 - "$CLI" <<'PY'
+import os, runpy, stat, sys, tempfile
+ns = runpy.run_path(sys.argv[1])
+
+fsync_dirs = []
+real_fsync = os.fsync
+def track_fsync(fd):
+    try:
+        st = os.fstat(fd)
+        fsync_dirs.append(stat.S_ISDIR(st.st_mode))
+    except OSError:
+        fsync_dirs.append(False)
+    return real_fsync(fd)
+
+os.fsync = track_fsync
+with tempfile.TemporaryDirectory() as td:
+    path = os.path.join(td, "manifest.json")
+    ns["atomic_json_write"](path, {"$schema": "vscode-chat-backup-manifest-v1", "version": 1})
+    assert os.path.exists(path), "atomic_json_write did not create target"
+    assert any(not d for d in fsync_dirs), "expected a regular-file fsync"
+    assert any(d for d in fsync_dirs), "expected a parent-directory fsync"
+print("PASS: atomic_json_write fsyncs temp file and parent directory")
+PY
+
 # ── separate manifest schema validation ──────────────────────────────────────
 IMMUTABLE='{
   "$schema": "vscode-chat-backup-manifest-v1",
@@ -233,6 +268,16 @@ expect_eq "$("$CLI" load-sidecar-manifest "$JSON_DIR/sidecar.json" | json_field 
 POINTER=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[]}); print(json.dumps(d))')
 printf '%s\n' "$POINTER" > "$JSON_DIR/pointer.json"
 expect_eq "$("$CLI" load-pointer-manifest "$JSON_DIR/pointer.json" | json_field state)" "uploaded" "pointer manifest loads with lifecycle fields"
+
+# Pointer must reject unknown keys so reconcile compares a closed schema.
+UNKNOWN_KEY=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[],"extra_field":True}); print(json.dumps(d))')
+printf '%s\n' "$UNKNOWN_KEY" > "$JSON_DIR/unknown-key.json"
+if "$CLI" load-pointer-manifest "$JSON_DIR/unknown-key.json" >/dev/null 2>&1; then
+  echo "FAIL: pointer manifest accepted unknown key"
+  fail=1
+else
+  echo "PASS: pointer manifest rejects unknown key"
+fi
 
 # Sidecar must not contain lifecycle fields.
 BAD_SIDECAR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["state"]="uploaded"; print(json.dumps(d))')
@@ -294,6 +339,44 @@ else
   echo "PASS: pointer manifest rejects invalid history state"
 fi
 
+# Pointer error field is validated and required for verify-failed state.
+GOOD_ERROR='{"message":"checksum mismatch","at":"'"$NOW"'"}'
+VERIFY_FAILED=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"verify-failed","restore":None,"pruned":None,"history":[],"error":json.loads(sys.argv[1])}); print(json.dumps(d))' "$GOOD_ERROR")
+printf '%s\n' "$VERIFY_FAILED" > "$JSON_DIR/verify-failed.json"
+expect_eq "$("$CLI" load-pointer-manifest "$JSON_DIR/verify-failed.json" | json_field state)" "verify-failed" "pointer manifest accepts verify-failed with valid error"
+
+NO_ERROR_VERIFY=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"verify-failed","restore":None,"pruned":None,"history":[]}); print(json.dumps(d))')
+printf '%s\n' "$NO_ERROR_VERIFY" > "$JSON_DIR/no-error-verify.json"
+if "$CLI" load-pointer-manifest "$JSON_DIR/no-error-verify.json" >/dev/null 2>&1; then
+  echo "FAIL: pointer manifest accepted verify-failed without error"
+  fail=1
+else
+  echo "PASS: pointer manifest rejects verify-failed without error"
+fi
+
+BAD_ERROR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[],"error":{"message":""}}); print(json.dumps(d))')
+printf '%s\n' "$BAD_ERROR" > "$JSON_DIR/bad-error.json"
+if "$CLI" load-pointer-manifest "$JSON_DIR/bad-error.json" >/dev/null 2>&1; then
+  echo "FAIL: pointer manifest accepted empty error message"
+  fail=1
+else
+  echo "PASS: pointer manifest rejects empty error message"
+fi
+
+EXTRA_ERROR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"verify-failed","restore":None,"pruned":None,"history":[],"error":{"message":"x","extra":1}}); print(json.dumps(d))')
+printf '%s\n' "$EXTRA_ERROR" > "$JSON_DIR/extra-error.json"
+if "$CLI" load-pointer-manifest "$JSON_DIR/extra-error.json" >/dev/null 2>&1; then
+  echo "FAIL: pointer manifest accepted error object with extra field"
+  fail=1
+else
+  echo "PASS: pointer manifest rejects error object with extra field"
+fi
+
+GOOD_HISTORY_ERROR=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[{"state":"verify-failed","at":"'"$NOW"'","error":json.loads(sys.argv[1])}]}); print(json.dumps(d))' "$GOOD_ERROR")
+printf '%s\n' "$GOOD_HISTORY_ERROR" > "$JSON_DIR/good-history-error.json"
+HISTORY_STATE=$("$CLI" load-pointer-manifest "$JSON_DIR/good-history-error.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["history"][0]["state"])')
+expect_eq "$HISTORY_STATE" "verify-failed" "pointer manifest accepts history entry with valid error"
+
 # ── reconcile pointer ─────────────────────────────────────────────────────────
 P1=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":1,"state":"uploaded","restore":None,"pruned":None,"history":[]}); print(json.dumps(d))')
 P2=$(printf '%s' "$IMMUTABLE" | python3 -c 'import json,sys; d=json.load(sys.stdin); d.update({"updated_at":"'"$NOW"'","generation":2,"state":"verified","restore":None,"pruned":None,"history":[{"state":"uploaded","at":"'"$NOW"'"}]}); print(json.dumps(d))')
@@ -313,6 +396,33 @@ if "$CLI" reconcile-pointer "$P1" "$P_CONFLICT" >/dev/null 2>&1; then
   fail=1
 else
   echo "PASS: reconcile_pointer rejects equal-generation unequal content as conflict"
+fi
+
+# ── CLI error handling ────────────────────────────────────────────────────────
+# Invalid inline JSON must produce a clean nonzero exit (no traceback).
+if "$CLI" atomic-json-write "$TMP_HOME/noop.json" 'not-json' >"$TMP_HOME/bad-json.out" 2>"$TMP_HOME/bad-json.err"; then
+  echo "FAIL: atomic-json-write accepted invalid JSON"
+  fail=1
+else
+  if grep -q "Traceback" "$TMP_HOME/bad-json.err"; then
+    echo "FAIL: atomic-json-write leaked traceback for invalid JSON"
+    fail=1
+  else
+    echo "PASS: atomic-json-write rejects invalid JSON cleanly"
+  fi
+fi
+
+# Missing manifest file must produce a clean nonzero exit (no traceback).
+if "$CLI" load-sidecar-manifest "$TMP_HOME/missing-manifest.json" >"$TMP_HOME/missing.out" 2>"$TMP_HOME/missing.err"; then
+  echo "FAIL: load-sidecar-manifest accepted missing file"
+  fail=1
+else
+  if grep -q "Traceback" "$TMP_HOME/missing.err"; then
+    echo "FAIL: load-sidecar-manifest leaked traceback for missing file"
+    fail=1
+  else
+    echo "PASS: load-sidecar-manifest rejects missing file cleanly"
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

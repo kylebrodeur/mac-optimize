@@ -45,7 +45,7 @@ SIDE_ONLY_FIELDS = frozenset(
 )
 IMMUTABLE_FIELDS = SIDE_ONLY_FIELDS
 LIFECYCLE_FIELDS = frozenset({"updated_at", "generation", "state", "restore", "pruned", "history"})
-POINTER_FIELDS = SIDE_ONLY_FIELDS | LIFECYCLE_FIELDS
+POINTER_FIELDS = SIDE_ONLY_FIELDS | LIFECYCLE_FIELDS | {"error"}
 
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -59,20 +59,20 @@ def _now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _sha256_file(path, expected_stat=None):
+def _sha256_file(name, dir_fd, expected_stat=None):
     h = hashlib.sha256()
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
     except OSError as e:
-        raise ManifestError(f"tree_fingerprint: cannot open file entry {path}: {e}")
+        raise ManifestError(f"tree_fingerprint: cannot open file entry {name}: {e}")
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise ManifestError(f"tree_fingerprint: opened entry is not a regular file: {path}")
+            raise ManifestError(f"tree_fingerprint: opened entry is not a regular file: {name}")
         if expected_stat is not None:
             if (st.st_dev, st.st_ino) != (expected_stat.st_dev, expected_stat.st_ino):
                 raise ManifestError(
-                    f"tree_fingerprint: file identity changed between lstat and open: {path}"
+                    f"tree_fingerprint: file identity changed between lstat and open: {name}"
                 )
         while True:
             chunk = os.read(fd, 65536)
@@ -93,15 +93,10 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
 
     The staged tree is treated as <workspace-hash>/ where workspace-hash is the
     basename of *root*. Records are emitted and sorted by raw bytes (not locale).
+    Traversal is descriptor-relative, never follows symlinks, and verifies entry
+    identity before recursing or hashing.
     """
     root = Path(root)
-    try:
-        root_st = os.lstat(root)
-    except OSError as e:
-        raise ManifestError(f"tree_fingerprint: cannot lstat root {root}: {e}")
-    if not stat.S_ISDIR(root_st.st_mode):
-        raise ManifestError(f"tree_fingerprint: root is not a directory: {root}")
-
     workspace_hash = root.name
     if not workspace_hash:
         raise ManifestError("tree_fingerprint: root has empty basename")
@@ -113,56 +108,72 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
     regular_file_count = 0
     regular_bytes = 0
 
-    def _on_walk_error(exc):
-        raise ManifestError(f"tree_fingerprint: cannot traverse directory {exc.filename}: {exc}")
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ManifestError(f"tree_fingerprint: cannot open root directory {root}: {e}")
 
-    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False, onerror=_on_walk_error):
-        dirnames.sort(key=lambda n: os.fsencode(n))
-        filenames.sort(key=lambda n: os.fsencode(n))
+    def _scan(dir_fd, rel_dir):
+        nonlocal regular_file_count, regular_bytes
+        try:
+            it = os.scandir(dir_fd)
+        except OSError as e:
+            raise ManifestError(f"tree_fingerprint: cannot scandir directory: {e}")
+        with it:
+            entries = sorted(it, key=lambda e: os.fsencode(e.name))
 
-        rel_dir = Path(dirpath).relative_to(root)
-        if rel_dir == Path("."):
-            rel_dir_bytes = b""
-        else:
-            rel_dir_bytes = os.fsencode(rel_dir.as_posix())
-
+        rel_dir_bytes = b"" if rel_dir == Path(".") else os.fsencode(rel_dir.as_posix())
         if rel_dir_bytes:
             dir_path_bytes = workspace_hash_bytes + b"/" + rel_dir_bytes + b"/"
         else:
             dir_path_bytes = workspace_hash_bytes + b"/"
         records.append((dir_path_bytes + b"\x00", None))
 
-        for dn in dirnames:
-            dp = Path(dirpath) / dn
+        for entry in entries:
+            name = entry.name
             try:
-                st = os.lstat(dp)
+                st = os.lstat(name, dir_fd=dir_fd)
             except OSError as e:
-                raise ManifestError(f"tree_fingerprint: cannot lstat directory entry {dp}: {e}")
-            if not stat.S_ISDIR(st.st_mode):
+                raise ManifestError(f"tree_fingerprint: cannot lstat entry {name}: {e}")
+
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    child_fd = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                    )
+                except OSError as e:
+                    raise ManifestError(
+                        f"tree_fingerprint: cannot open directory entry {name}: {e}"
+                    )
+                try:
+                    child_st = os.fstat(child_fd)
+                    if (child_st.st_dev, child_st.st_ino) != (st.st_dev, st.st_ino):
+                        raise ManifestError(
+                            f"tree_fingerprint: directory identity changed: {name}"
+                        )
+                    _scan(child_fd, rel_dir / name)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(st.st_mode):
+                content_hash = _sha256_file(name, dir_fd, st)
+                rel_file = rel_dir / name if rel_dir != Path(".") else Path(name)
+                rel_file_bytes = os.fsencode(rel_file.as_posix())
+                file_path_bytes = workspace_hash_bytes + b"/" + rel_file_bytes
+                regular_file_count += 1
+                regular_bytes += st.st_size
+                hash_bytes = content_hash.encode("ascii")
+                records.append(
+                    (file_path_bytes + b"\x00" + hash_bytes + b"\x00", content_hash)
+                )
+            else:
                 raise ManifestError(
-                    f"tree_fingerprint: directory entry is not a directory: {dp}"
+                    f"tree_fingerprint: entry is not a regular file or directory: {name}"
                 )
 
-        for fn in filenames:
-            fp = Path(dirpath) / fn
-            try:
-                st = os.lstat(fp)
-            except OSError as e:
-                raise ManifestError(f"tree_fingerprint: cannot lstat file entry {fp}: {e}")
-            if not stat.S_ISREG(st.st_mode):
-                raise ManifestError(
-                    f"tree_fingerprint: file entry is not a regular file: {fp}"
-                )
-
-            rel_file = rel_dir / fn if rel_dir != Path(".") else Path(fn)
-            rel_file_bytes = os.fsencode(rel_file.as_posix())
-            file_path_bytes = workspace_hash_bytes + b"/" + rel_file_bytes
-            content_hash = _sha256_file(fp, st)
-            size = st.st_size
-            regular_file_count += 1
-            regular_bytes += size
-            hash_bytes = content_hash.encode("ascii")
-            records.append((file_path_bytes + b"\x00" + hash_bytes + b"\x00", content_hash))
+    try:
+        _scan(root_fd, Path("."))
+    finally:
+        os.close(root_fd)
 
     records.sort(key=lambda item: item[0])
     payload = b"".join(r[0] for r in records)
@@ -186,7 +197,7 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
 
 
 def atomic_json_write(path: Path, value: dict) -> None:
-    """Write JSON atomically with mode 0600."""
+    """Write JSON atomically with mode 0600 and durable rename."""
     import tempfile
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -196,12 +207,24 @@ def atomic_json_write(path: Path, value: dict) -> None:
         suffix=f".{os.getpid()}.{time.time_ns()}",
     )
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f, indent=2, sort_keys=True)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, p)
+        # Make the rename durable by fsyncing the parent directory.
+        try:
+            dir_fd = os.open(p.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as e:
+            raise ManifestError(
+                f"atomic_json_write: cannot fsync parent directory {p.parent}: {e}"
+            )
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -242,10 +265,32 @@ def _require_sha_prefix(d, k):
         raise ManifestError(f"field {k} must start with 'sha256:': {d[k]}")
 
 
+def _validate_error_field(error, context):
+    if error is None:
+        return
+    if not isinstance(error, dict):
+        raise ManifestError(f"{context} must be an object")
+    if "message" not in error or not isinstance(error["message"], str) or not error["message"]:
+        raise ManifestError(f"{context}.message must be a non-empty string")
+    if "at" in error and not _iso_ok(error["at"]):
+        raise ManifestError(f"{context}.at must be ISO 8601 UTC")
+    allowed = {"message", "at"}
+    forbidden = set(error.keys()) - allowed
+    if forbidden:
+        raise ManifestError(f"{context} contains disallowed fields: {sorted(forbidden)}")
+
+
 def _validate_pointer_state_evidence(data):
     """Enforce state-specific durable evidence per the design."""
     state = data.get("state")
     tree_fp = data.get("tree_fingerprint")
+
+    _validate_error_field(data.get("error"), "error")
+    if state in ("verify-failed", "restore-failed"):
+        if data.get("error") is None:
+            raise ManifestError(f"state {state} requires an error object")
+    elif data.get("error") is not None:
+        raise ManifestError(f"state {state} must not carry error evidence")
 
     history = data.get("history", [])
     for i, item in enumerate(history):
@@ -255,6 +300,7 @@ def _validate_pointer_state_evidence(data):
             raise ManifestError(f"history[{i}].state must be a valid lifecycle state")
         if not _iso_ok(item.get("at", "")):
             raise ManifestError(f"history[{i}].at must be ISO 8601 UTC")
+        _validate_error_field(item.get("error"), f"history[{i}].error")
 
     restore = data.get("restore")
     pruned = data.get("pruned")
@@ -270,6 +316,7 @@ def _validate_pointer_state_evidence(data):
             raise ManifestError("restore.destination must be an absolute path")
         if not _iso_ok(restore.get("restored_at", "")):
             raise ManifestError("restore.restored_at must be ISO 8601 UTC")
+        _validate_error_field(restore.get("error"), "restore.error")
 
     if state == "pruned":
         if not isinstance(pruned, dict):
@@ -378,6 +425,10 @@ def load_pointer_manifest(path: Path) -> dict:
         raise ManifestError("history must be a list")
 
     _validate_pointer_state_evidence(data)
+
+    forbidden = set(data.keys()) - POINTER_FIELDS
+    if forbidden:
+        raise ManifestError(f"pointer contains disallowed fields: {sorted(forbidden)}")
 
     return data
 
@@ -516,6 +567,12 @@ def main(argv=None):
         args.func(args)
     except ManifestError as e:
         print(f"vscode-chat-backup: {e}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"vscode-chat-backup: invalid JSON: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"vscode-chat-backup: I/O error: {e}", file=sys.stderr)
         return 1
     return 0
 
