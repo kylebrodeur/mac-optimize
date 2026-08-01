@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""vscode-chat-backup — manifest and deterministic fingerprint primitives."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+@dataclass(frozen=True)
+class SnapshotFingerprint:
+    fingerprint: str
+    regular_file_count: int
+    regular_bytes: int
+    records: List[Dict[str, Optional[Any]]] = field(default_factory=list)
+
+
+SCHEMA = "vscode-chat-backup-manifest-v1"
+VERSION = 1
+LIFECYCLE_STATES = frozenset(
+    {"uploaded", "verified", "restored", "pruned", "verify-failed", "restore-failed"}
+)
+SIDE_ONLY_FIELDS = frozenset(
+    {
+        "$schema",
+        "version",
+        "workspace_hash",
+        "original_workspace_path",
+        "source_path",
+        "archive_name",
+        "tree_fingerprint",
+        "archive_sha256",
+        "archive_size_bytes",
+        "regular_file_count",
+        "regular_bytes",
+        "created_at",
+    }
+)
+IMMUTABLE_FIELDS = SIDE_ONLY_FIELDS
+LIFECYCLE_FIELDS = frozenset({"updated_at", "generation", "state", "restore", "pruned", "history"})
+POINTER_FIELDS = SIDE_ONLY_FIELDS | LIFECYCLE_FIELDS
+
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+class ManifestError(ValueError):
+    pass
+
+
+def _now_utc():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def tree_fingerprint(root: Path) -> SnapshotFingerprint:
+    """Return deterministic fingerprint metadata for a staged tree.
+
+    The staged tree is treated as <workspace-hash>/ where workspace-hash is the
+    basename of *root*. Records are emitted and sorted by raw bytes (not locale).
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise ManifestError(f"tree_fingerprint: not a directory: {root}")
+
+    workspace_hash = root.name
+    if not workspace_hash:
+        raise ManifestError("tree_fingerprint: root has empty basename")
+    if not re.fullmatch(r"[0-9A-Fa-f]{1,}", workspace_hash):
+        raise ManifestError("tree_fingerprint: workspace_hash must be hex")
+
+    workspace_hash_bytes = workspace_hash.encode("ascii")
+    records = []
+    regular_file_count = 0
+    regular_bytes = 0
+
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        dirnames.sort(key=lambda n: os.fsencode(n))
+        filenames.sort(key=lambda n: os.fsencode(n))
+
+        rel_dir = Path(dirpath).relative_to(root)
+        if rel_dir == Path("."):
+            rel_dir_bytes = b""
+        else:
+            rel_dir_bytes = os.fsencode(rel_dir.as_posix())
+
+        if rel_dir_bytes:
+            dir_path_bytes = workspace_hash_bytes + b"/" + rel_dir_bytes + b"/"
+        else:
+            dir_path_bytes = workspace_hash_bytes + b"/"
+        records.append((dir_path_bytes + b"\x00", None))
+
+        for fn in filenames:
+            fp = Path(dirpath) / fn
+            try:
+                st = os.lstat(fp)
+            except OSError as e:
+                raise ManifestError(f"tree_fingerprint: cannot stat {fp}: {e}")
+            if not stat.S_ISREG(st.st_mode):
+                continue
+
+            rel_file = rel_dir / fn if rel_dir != Path(".") else Path(fn)
+            rel_file_bytes = os.fsencode(rel_file.as_posix())
+            file_path_bytes = workspace_hash_bytes + b"/" + rel_file_bytes
+            content_hash = _sha256_file(fp)
+            size = st.st_size
+            regular_file_count += 1
+            regular_bytes += size
+            hash_bytes = content_hash.encode("ascii")
+            records.append((file_path_bytes + b"\x00" + hash_bytes + b"\x00", content_hash))
+
+    records.sort(key=lambda item: item[0])
+    payload = b"".join(r[0] for r in records)
+    digest = _sha256_bytes(payload)
+
+    def _record_obj(item):
+        body = item[0]
+        typ = "directory" if item[1] is None else "file"
+        parts = body.split(b"\x00")
+        path_text = parts[0].decode("utf-8", errors="surrogateescape")
+        if typ == "file":
+            return {"path": path_text, "type": typ, "content_sha256": item[1]}
+        return {"path": path_text, "type": typ, "content_sha256": None}
+
+    return SnapshotFingerprint(
+        fingerprint=f"sha256:{digest}",
+        regular_file_count=regular_file_count,
+        regular_bytes=regular_bytes,
+        records=[_record_obj(r) for r in records],
+    )
+
+
+def atomic_json_write(path: Path, value: dict) -> None:
+    """Write JSON atomically with mode 0600."""
+    import tempfile
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=p.parent,
+        prefix=f".{p.name}.tmp.",
+        suffix=f".{os.getpid()}.{time.time_ns()}",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, p)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _iso_ok(v):
+    return isinstance(v, str) and ISO_RE.match(v) is not None
+
+
+def _require_str(d, k):
+    if k not in d:
+        raise ManifestError(f"missing field: {k}")
+    if not isinstance(d[k], str) or not d[k]:
+        raise ManifestError(f"field {k} must be a non-empty string")
+
+
+def _validate_canonical_source_path(data):
+    expected = str(canonical_source_path(data["workspace_hash"]))
+    if data.get("source_path") != expected:
+        raise ManifestError(
+            f"source_path must equal the canonical path {expected!r}, got {data.get('source_path')!r}"
+        )
+
+
+def _require_int(d, k):
+    if k not in d:
+        raise ManifestError(f"missing field: {k}")
+    if not isinstance(d[k], int) or isinstance(d[k], bool):
+        raise ManifestError(f"field {k} must be an integer")
+
+
+def _require_sha_prefix(d, k):
+    _require_str(d, k)
+    if not d[k].startswith("sha256:"):
+        raise ManifestError(f"field {k} must start with 'sha256:': {d[k]}")
+
+
+def _validate_pointer_state_evidence(data):
+    """Enforce state-specific durable evidence per the design."""
+    state = data.get("state")
+    tree_fp = data.get("tree_fingerprint")
+
+    history = data.get("history", [])
+    for i, item in enumerate(history):
+        if not isinstance(item, dict):
+            raise ManifestError(f"history[{i}] must be an object")
+        if item.get("state") not in LIFECYCLE_STATES:
+            raise ManifestError(f"history[{i}].state must be a valid lifecycle state")
+        if not _iso_ok(item.get("at", "")):
+            raise ManifestError(f"history[{i}].at must be ISO 8601 UTC")
+
+    restore = data.get("restore")
+    pruned = data.get("pruned")
+
+    if state in ("restored", "pruned"):
+        if not isinstance(restore, dict):
+            raise ManifestError(f"state {state} requires a restore object")
+        _require_sha_prefix(restore, "verified_fingerprint")
+        if restore["verified_fingerprint"] != tree_fp:
+            raise ManifestError("restore.verified_fingerprint must equal tree_fingerprint")
+        _require_str(restore, "destination")
+        if not os.path.isabs(restore["destination"]):
+            raise ManifestError("restore.destination must be an absolute path")
+        if not _iso_ok(restore.get("restored_at", "")):
+            raise ManifestError("restore.restored_at must be ISO 8601 UTC")
+
+    if state == "pruned":
+        if not isinstance(pruned, dict):
+            raise ManifestError("state pruned requires a pruned object")
+        _require_str(pruned, "trash_name")
+        if not _iso_ok(pruned.get("pruned_at", "")):
+            raise ManifestError("pruned.pruned_at must be ISO 8601 UTC")
+
+    if state in ("uploaded", "verified", "verify-failed", "restore-failed"):
+        if restore is not None and not isinstance(restore, dict):
+            raise ManifestError("restore must be null or object")
+        if state != "restore-failed" and restore is not None and "error" not in restore:
+            if restore.get("verified_fingerprint"):
+                raise ManifestError(
+                    f"state {state} must not carry restore.verified_fingerprint"
+                )
+
+    if state != "pruned" and pruned is not None:
+        raise ManifestError(f"state {state} must not carry pruned evidence")
+
+
+def load_sidecar_manifest(path: Path) -> dict:
+    """Validate and return an immutable sidecar manifest."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ManifestError("manifest must be a JSON object")
+
+    if data.get("$schema") != SCHEMA:
+        raise ManifestError(f"manifest $schema must be {SCHEMA}")
+    if data.get("version") != VERSION:
+        raise ManifestError(f"manifest version must be {VERSION}")
+
+    for k in SIDE_ONLY_FIELDS:
+        if k in ("$schema", "version"):
+            continue
+        if k in ("archive_size_bytes", "regular_file_count", "regular_bytes"):
+            _require_int(data, k)
+        elif k in ("tree_fingerprint", "archive_sha256"):
+            _require_sha_prefix(data, k)
+        else:
+            _require_str(data, k)
+
+    if not _iso_ok(data.get("created_at", "")):
+        raise ManifestError("created_at must be ISO 8601 UTC")
+
+    _validate_canonical_source_path(data)
+
+    forbidden = set(data.keys()) - SIDE_ONLY_FIELDS
+    if forbidden:
+        raise ManifestError(f"sidecar contains lifecycle/disallowed fields: {sorted(forbidden)}")
+
+    return data
+
+
+def load_pointer_manifest(path: Path) -> dict:
+    """Validate and return a mutable pointer manifest."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ManifestError("manifest must be a JSON object")
+
+    if data.get("$schema") != SCHEMA:
+        raise ManifestError(f"manifest $schema must be {SCHEMA}")
+    if data.get("version") != VERSION:
+        raise ManifestError(f"manifest version must be {VERSION}")
+
+    for k in IMMUTABLE_FIELDS:
+        if k in ("$schema", "version"):
+            continue
+        if k in ("archive_size_bytes", "regular_file_count", "regular_bytes"):
+            _require_int(data, k)
+        elif k in ("tree_fingerprint", "archive_sha256"):
+            _require_sha_prefix(data, k)
+        else:
+            _require_str(data, k)
+
+    if not _iso_ok(data.get("created_at", "")):
+        raise ManifestError("created_at must be ISO 8601 UTC")
+
+    _validate_canonical_source_path(data)
+
+    missing_lifecycle = LIFECYCLE_FIELDS - set(data.keys())
+    if missing_lifecycle:
+        raise ManifestError(f"pointer missing lifecycle fields: {sorted(missing_lifecycle)}")
+
+    _require_str(data, "updated_at")
+    if not _iso_ok(data["updated_at"]):
+        raise ManifestError("updated_at must be ISO 8601 UTC")
+
+    _require_int(data, "generation")
+    if data["generation"] < 1:
+        raise ManifestError("generation must be >= 1")
+
+    _require_str(data, "state")
+    if data["state"] not in LIFECYCLE_STATES:
+        raise ManifestError(f"state must be one of {sorted(LIFECYCLE_STATES)}")
+
+    if data.get("restore") is not None and not isinstance(data["restore"], dict):
+        raise ManifestError("restore must be null or object")
+    if data.get("pruned") is not None and not isinstance(data["pruned"], dict):
+        raise ManifestError("pruned must be null or object")
+    if not isinstance(data.get("history"), list):
+        raise ManifestError("history must be a list")
+
+    _validate_pointer_state_evidence(data)
+
+    return data
+
+
+def validate_pointer_sidecar(pointer: dict, sidecar: dict) -> None:
+    """Raise ManifestError if any immutable field in pointer differs from sidecar."""
+    for k in IMMUTABLE_FIELDS:
+        if k not in pointer:
+            raise ManifestError(f"pointer missing immutable field: {k}")
+        if k not in sidecar:
+            raise ManifestError(f"sidecar missing immutable field: {k}")
+        if pointer[k] != sidecar[k]:
+            raise ManifestError(
+                f"immutable field mismatch for {k}: pointer={pointer[k]!r} sidecar={sidecar[k]!r}"
+            )
+
+
+def reconcile_pointer(local: Optional[dict], remote: Optional[dict]) -> dict:
+    """Select higher generation; equal-generation unequal content is conflict."""
+    if local is None and remote is None:
+        raise ManifestError("reconcile_pointer: both inputs are None")
+    if local is None:
+        return remote
+    if remote is None:
+        return local
+
+    local_gen = local["generation"]
+    remote_gen = remote["generation"]
+
+    if local_gen > remote_gen:
+        return local
+    if remote_gen > local_gen:
+        return remote
+
+    # Equal generation: content must be identical.
+    if local == remote:
+        return local
+
+    raise ManifestError(
+        "reconcile_pointer: equal-generation manifest conflict requires manual resolution"
+    )
+
+
+def canonical_source_path(workspace_hash: str) -> Path:
+    """Derive the canonical local workspaceStorage path and reject traversal."""
+    if not isinstance(workspace_hash, str) or not workspace_hash:
+        raise ManifestError("workspace_hash must be a non-empty string")
+    if workspace_hash in (".", "..") or "/" in workspace_hash or "\\" in workspace_hash:
+        raise ManifestError("workspace_hash must be a single path component")
+    if "\x00" in workspace_hash:
+        raise ManifestError("workspace_hash must not contain NUL")
+    return Path.home() / "Library/Application Support/Code/User/workspaceStorage" / workspace_hash
+
+
+def _load_json_or_none(arg):
+    if arg == "-":
+        return None
+    try:
+        return json.loads(arg)
+    except json.JSONDecodeError as e:
+        raise ManifestError(f"invalid JSON: {e}")
+
+
+def _cmd_tree_fingerprint(args):
+    result = tree_fingerprint(args.root)
+    print(json.dumps(asdict(result), indent=2))
+
+
+def _cmd_atomic_json_write(args):
+    value = json.loads(args.value)
+    atomic_json_write(args.path, value)
+
+
+def _cmd_load_pointer_manifest(args):
+    print(json.dumps(load_pointer_manifest(args.path), indent=2))
+
+
+def _cmd_load_sidecar_manifest(args):
+    print(json.dumps(load_sidecar_manifest(args.path), indent=2))
+
+
+def _cmd_validate_pointer_sidecar(args):
+    pointer = _load_json_or_none(args.pointer)
+    sidecar = _load_json_or_none(args.sidecar)
+    validate_pointer_sidecar(pointer, sidecar)
+
+
+def _cmd_reconcile_pointer(args):
+    local = _load_json_or_none(args.local)
+    remote = _load_json_or_none(args.remote)
+    result = reconcile_pointer(local, remote)
+    print(json.dumps(result, indent=2))
+
+
+def _cmd_canonical_source_path(args):
+    print(canonical_source_path(args.workspace_hash))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="vscode-chat-backup")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("tree-fingerprint", help="compute deterministic tree fingerprint")
+    p.add_argument("root")
+    p.set_defaults(func=_cmd_tree_fingerprint)
+
+    p = sub.add_parser("atomic-json-write", help="atomically write JSON with mode 0600")
+    p.add_argument("path")
+    p.add_argument("value")
+    p.set_defaults(func=_cmd_atomic_json_write)
+
+    p = sub.add_parser("load-pointer-manifest", help="validate and load a pointer manifest")
+    p.add_argument("path")
+    p.set_defaults(func=_cmd_load_pointer_manifest)
+
+    p = sub.add_parser("load-sidecar-manifest", help="validate and load an immutable sidecar manifest")
+    p.add_argument("path")
+    p.set_defaults(func=_cmd_load_sidecar_manifest)
+
+    p = sub.add_parser("validate-pointer-sidecar", help="validate pointer against sidecar immutable fields")
+    p.add_argument("pointer")
+    p.add_argument("sidecar")
+    p.set_defaults(func=_cmd_validate_pointer_sidecar)
+
+    p = sub.add_parser("reconcile-pointer", help="reconcile local and remote pointer manifests")
+    p.add_argument("local")
+    p.add_argument("remote")
+    p.set_defaults(func=_cmd_reconcile_pointer)
+
+    p = sub.add_parser("canonical-source-path", help="derive canonical source storage path")
+    p.add_argument("workspace_hash")
+    p.set_defaults(func=_cmd_canonical_source_path)
+
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except ManifestError as e:
+        print(f"vscode-chat-backup: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
