@@ -20,7 +20,7 @@
 - Mutable lifecycle state is authoritative only in `<workspace-hash>.manifest.json`; remote and local state transitions use same-directory temp writes, `fsync`, atomic rename, and crypt-remote temp-upload-then-move.
 - Verify and restore must check downloaded archive byte size and SHA-256 before metadata parsing or extraction.
 - Tar validation rejects absolute paths, `..`, backslash traversal, duplicate/conflicting entries, symlinks, hard links, devices, sockets, FIFOs, overlong paths, member-count overflow, and unbounded file totals before extraction.
-- Restore extracts into a hidden sibling of the destination parent, fingerprints the sole `<workspace-hash>/` child, then atomically renames that child into a new non-existing destination; cross-filesystem destinations are rejected.
+- Restore extracts into a hidden sibling of the destination parent, fingerprints the sole `<workspace-hash>/` child, then atomically renames that child into a new non-existing destination on that same destination filesystem; reject only if sibling creation or same-device verification fails.
 - Prune is the only local deletion path. It journals the intended quarantine and Trash name before renaming, re-fingerprints the quarantined directory, and clears the journal only after rollback or a committed prune transition.
 - `rclone` is the only new runtime dependency; use its built-in personal Google OAuth flow and never require a server, bucket, service account, or custom OAuth service.
 - Do not modify `mac-reclaim` to perform archive/prune operations; preserve its review-only workspaceStorage guard.
@@ -49,13 +49,16 @@
 **Interfaces:**
 - `tree_fingerprint(root: Path) -> SnapshotFingerprint` returns `sha256:<hex>`, `regular_file_count`, `regular_bytes`, and sorted per-entry records.
 - `atomic_json_write(path: Path, value: dict) -> None` writes mode `0600` through a same-directory temp file, flush/fsync, and atomic rename.
-- `load_manifest(path: Path) -> dict` validates required fields and state values before use.
+- `load_pointer_manifest(path: Path) -> dict` validates the mutable lifecycle pointer schema and state values.
+- `load_sidecar_manifest(path: Path) -> dict` validates immutable archive snapshot metadata without lifecycle fields.
+- `validate_pointer_sidecar(pointer: dict, sidecar: dict) -> None` requires every immutable field in the pointer to exactly match its referenced sidecar before verify, restore, or prune.
+- `reconcile_pointer(local: dict | None, remote: dict | None) -> dict` selects the higher `generation`; equal-generation unequal immutable/lifecycle content is a hard conflict requiring manual resolution.
 - `canonical_source_path(workspace_hash: str) -> Path` derives only `~/Library/Application Support/Code/User/workspaceStorage/<hash>` and rejects traversal.
 
 - [ ] **Step 1: Write failing fixture assertions** for identical-tree stability, byte-change divergence, canonical source derivation, mode `0600`, and interrupted atomic-write recovery.
 - [ ] **Step 2: Run the focused fixture** and confirm the new CLI/helper behavior is absent.
-- [ ] **Step 3: Implement deterministic traversal.** Sort relative POSIX paths; record type, relative path, regular-file size, and per-file SHA-256; reject non-regular/non-directory entries; exclude timestamps, ownership, and mode bits from the digest.
-- [ ] **Step 4: Implement manifest schema validation.** Require `workspace_hash`, `original_workspace_path`, canonical `source_path`, immutable `archive_name`, `tree_fingerprint`, `archive_sha256`, `archive_size_bytes`, `regular_file_count`, `regular_bytes`, `created_at`, `updated_at`, `generation`, and valid lifecycle state.
+- [ ] **Step 3: Implement the exact deterministic fingerprint wire format.** Treat the staged tree as `<workspace-hash>/`; sort bytewise under `LC_ALL=C`; emit `<workspace-hash>/<relative-file>\0<sha256(file-contents)>\0` for each regular file and `<workspace-hash>/<relative-dir>/\0` for each directory; hash the concatenated bytes as lowercase `sha256:<hex>`. Return counts/bytes/records as metadata only; never include size/type metadata in the digest. Add a golden-vector assertion.
+- [ ] **Step 4: Implement separate manifest schema validation.** Require both schemas to carry explicit schema/version fields; sidecars contain `workspace_hash`, `original_workspace_path`, canonical `source_path`, immutable `archive_name`, `tree_fingerprint`, `archive_sha256`, `archive_size_bytes`, `regular_file_count`, `regular_bytes`, and `created_at`; pointers contain those immutable fields plus `updated_at`, `generation`, valid lifecycle state, `restore`, `pruned`, and `history`. Reject pointer/sidecar immutable-field mismatches.
 - [ ] **Step 5: Run the focused fixture** and confirm all primitive assertions pass.
 - [ ] **Step 6: Commit** `feat: add chat backup manifest primitives`.
 
@@ -88,16 +91,19 @@
 - `upload(workspace_hash: str, remote: str) -> Manifest` creates one immutable archive and sidecar, then publishes the mutable pointer.
 - `run_rclone(args: list[str], timeout: float) -> CompletedProcess` uses bounded timeouts and raises a typed failure without touching source state.
 - Remote objects: `archives/<hash>-<archive_sha256>.tar.gz.bin`, `manifests/<hash>-<archive_sha256>.manifest.json`, and current pointer `manifests/<hash>.manifest.json`.
+- Local/remote reconciliation is generation-authoritative for lifecycle pointers and runs on upload, verify, restore, prune, and first use on a second Mac.
 
 - [ ] **Step 1: Add a fake-rclone fixture** that copies local objects to a disposable remote root, supports temp-upload-then-move, and can inject timeout/interrupted-upload failures.
 - [ ] **Step 2: Assert upload leaves the source byte-identical and creates no symlink/special archive member.**
 - [ ] **Step 3: Implement gzip tar creation** with one `<workspace-hash>/` top-level directory and regular files/directories only.
 - [ ] **Step 4: Compute archive hash/size before naming the immutable archive object.** Upload and re-download to confirm hash/size before publishing either manifest.
 - [ ] **Step 5: Persist the immutable sidecar (snapshot metadata only), then the current lifecycle pointer** using atomic local writes and crypt-remote temp-upload-then-move.
-- [ ] **Step 6: Add idempotency tests** proving a later `verified`, `restored`, or `pruned` pointer is never regressed to `uploaded`, and superseded archive/sidecar objects remain available.
-- [ ] **Step 7: Add interrupted-upload and signal cleanup tests** proving source remains untouched and staging is removed.
-- [ ] **Step 8: Run upload tests** with fake rclone and confirm no real remote/cache command is reached.
-- [ ] **Step 9: Commit** `feat: upload encrypted immutable chat archives`.
+- [ ] **Step 6: Implement generation-based local/remote pointer reconciliation**: higher generation wins; equal-generation unequal content is a hard conflict; equal content is idempotent. Reconcile before and after upload, recover when local atomic write succeeds but remote publication fails, and on first use from a second Mac.
+- [ ] **Step 7: Add crash-injection and conflict tests** for local-write/remote-publish divergence, higher-generation selection, equal-generation equality, and equal-generation conflicts.
+- [ ] **Step 8: Add idempotency tests** proving a later `verified`, `restored`, or `pruned` pointer is never regressed to `uploaded`, and superseded archive/sidecar objects remain available.
+- [ ] **Step 9: Add interrupted-upload and signal cleanup tests** proving source remains untouched and staging is removed.
+- [ ] **Step 10: Run upload tests** with fake rclone and confirm no real remote/cache command is reached.
+- [ ] **Step 11: Commit** `feat: upload encrypted immutable chat archives`.
 
 ### Task 4: Implement hostile archive verification
 
@@ -128,7 +134,7 @@
 - Destination parent must be existing/writable and same-filesystem with its hidden extraction sibling.
 
 - [ ] **Step 1: Add restore fixtures** with a valid archive, pre-existing destination, destination on another volume, and archive whose only child is `<workspace-hash>/`.
-- [ ] **Step 2: Assert existing destinations are never overwritten** and cross-volume destinations fail before partial finalization.
+- [ ] **Step 2: Assert existing destinations are never overwritten; assert an external-volume destination succeeds through destination-local staging; reject only when sibling creation or same-device verification fails.**
 - [ ] **Step 3: Implement hidden sibling extraction** under the validated destination parent, validate hash/size and hostile metadata, fingerprint the sole `<hash>` child, then atomically rename that child—not the wrapper—to the requested destination.
 - [ ] **Step 4: Assert restore output has exactly one `<workspace-hash>` tree and no doubled wrapper.**
 - [ ] **Step 5: Persist `restored` evidence only after final rename and remote/local manifest commits succeed; clean staging on every failure/signal.**
@@ -166,11 +172,13 @@
 - Modify: `test/vscode-chat-backup-test.sh`
 
 - [ ] **Step 1: Add install/doctor checks** that install the executable and report missing `rclone` only for backup commands; safe `mac-reclaim` remains usable without rclone.
-- [ ] **Step 2: Document personal Google Drive OAuth, `rclone crypt`, 1Password recovery material, exact command order, and the no-delete default.**
-- [ ] **Step 3: Add the full local round-trip test**: plan → upload → verify → restore → prune-verified, with an explicit review gate between dry-run output and prune.
-- [ ] **Step 4: Add remote download/recovery rehearsal** using a fresh rclone config fixture and verify archive/sidecar/pointer recovery.
-- [ ] **Step 5: Run all focused Bash syntax, fixture, install, and doctor checks** under `/bin/bash` 3.2; run no destructive command against live workspaceStorage.
-- [ ] **Step 6: Commit** `feat: ship vscode chat backup workflow`.
+- [ ] **Step 2: Implement `vscode-chat-backup recovery-document`** to generate/regenerate portable rclone crypt recovery material containing remote names, crypt settings, Drive root details, rclone version, manifest layout, and re-authentication steps; never upload it, and save only with mode `0600` when a file output is requested.
+- [ ] **Step 3: Add a fresh-config recovery test** that reconstructs a disposable rclone crypt configuration/remote from the generated document and restores a sample archive; assert the document is absent from uploaded objects and plaintext staging unless explicitly saved mode `0600`.
+- [ ] **Step 4: Document personal Google Drive OAuth, `rclone crypt`, 1Password recovery material, exact command order, and the no-delete default.**
+- [ ] **Step 5: Add the full local round-trip test**: plan → upload → verify → restore → prune-verified, with an explicit review gate between dry-run output and prune.
+- [ ] **Step 6: Add remote download/recovery rehearsal** using a fresh rclone config fixture and verify archive/sidecar/pointer recovery.
+- [ ] **Step 7: Run all focused Bash syntax, fixture, install, and doctor checks** under `/bin/bash` 3.2; run no destructive command against live workspaceStorage.
+- [ ] **Step 8: Commit** `feat: ship vscode chat backup workflow`.
 
 ## Plan Self-Review Checklist
 
@@ -178,7 +186,7 @@
 - [x] Symlink/special-file source rejection happens before copy and staged-tree validation happens again.
 - [x] Archive hash/size are computed before immutable naming; archive and sidecar precede the mutable pointer.
 - [x] Verify/restore validate downloaded hash/size before parsing and never overwrite destinations.
-- [x] Restore renames the sole hash child, not the wrapper, and rejects cross-filesystem destinations.
+- [x] Restore renames the sole hash child, not the wrapper, and stages under the destination parent so external-volume destinations work when same-device checks pass.
 - [x] Prune journals before rename, records Trash identity, reconciles crashes, and conditionally rolls back.
 - [x] Open-file checks distinguish closed, open, and unavailable; deletion rechecks immediately before each removal.
 - [x] Sidecar preserves immutable metadata for every retained archive; lifecycle state remains pointer-authoritative.
