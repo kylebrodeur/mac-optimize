@@ -2,11 +2,11 @@
 
 End-to-end verification on macOS: clone → install → run → maintain → uninstall.
 
-> **Read this first.** As of the `agent-machine-lib` adoption commit, this repo's
-> shared code has been **statically verified only** (parses, loads, platform-detects)
-> — it has not been *run* on macOS. This document is the first-run verification.
-> Every destructive step is gated behind a dry-run whose correctness you assert
-> before proceeding. If a **STOP** check fails, stop and report it.
+> **Read this first.** This procedure is the durable macOS verification checklist
+> for the shared `agent-machine-lib` adoption. The first macOS pass ran on
+> 2026-07-31; its results are recorded below. Every destructive step is gated
+> behind a dry-run whose correctness you assert before proceeding. If a **STOP**
+> check fails, stop and report it.
 
 Record results as you go; the last section is a copy-paste template.
 
@@ -43,10 +43,10 @@ Record: macOS version, bash version, free space.
 ```bash
 git clone https://github.com/kylebrodeur/mac-optimize.git
 cd mac-optimize
-git log --oneline -3
+git log --oneline --grep='agent-machine-lib' -5
 ```
 
-**Expect:** the top commit mentions adopting `agent-machine-lib`.
+**Expect:** history includes the `agent-machine-lib` adoption or follow-up vendoring commits.
 
 ## 2. Build
 
@@ -194,6 +194,40 @@ Re-running immediately should reclaim ≈0 (idempotent).
 
 ### 4d. Deep tier
 
+First verify the `agent-session-kill` delegation logic with a disposable home so
+the check does not scan live agent state:
+
+```bash
+set -o pipefail
+fake_home=$(mktemp -d /tmp/mac-reclaim-delegation.XXXXXX)
+trap 'rm -rf "$fake_home"' EXIT
+mkdir -p "$fake_home/.claude/projects"/{old1,old2}
+mkdir -p "$fake_home/Library/Application Support/Claude/vm_bundles"/{old1,old2}
+mkdir -p "$fake_home/Library/Application Support/Claude/local-agent-mode-sessions"/{old1,old2}
+touch -t 202401010000 "$fake_home/.claude/projects"/old*
+touch -t 202401010000 "$fake_home/Library/Application Support/Claude/vm_bundles"/old*
+touch -t 202401010000 "$fake_home/Library/Application Support/Claude/local-agent-mode-sessions"/old*
+
+# Without agent-session-kill on PATH, .claude/projects is handled locally.
+HOME="$fake_home" PATH=/usr/bin:/bin:/usr/sbin:/sbin KEEP_RECENT=0 KEEP_DAYS=0 \
+  ./bin/mac-reclaim --deep --dry-run | tee /tmp/mac-reclaim-no-session-kill.txt
+grep -qF '~/.claude/projects' /tmp/mac-reclaim-no-session-kill.txt
+
+# With agent-session-kill on PATH, .claude/projects is delegated and not listed,
+# while vm_bundles and local-agent-mode-sessions still stay locally handled.
+shim=$(mktemp -d /tmp/agent-session-kill.XXXXXX)
+printf '#!/bin/sh\nexit 0\n' > "$shim/agent-session-kill"
+chmod +x "$shim/agent-session-kill"
+HOME="$fake_home" PATH="$shim:/usr/bin:/bin:/usr/sbin:/sbin" KEEP_RECENT=0 KEEP_DAYS=0 \
+  ./bin/mac-reclaim --deep --dry-run | tee /tmp/mac-reclaim-with-session-kill.txt
+grep -qF 'delegating ~/.claude/projects to agent-session-kill' /tmp/mac-reclaim-with-session-kill.txt
+! grep -qF '~/.claude/projects/old' /tmp/mac-reclaim-with-session-kill.txt
+grep -qF '~/Library/Application Support/Claude/vm_bundles/old' /tmp/mac-reclaim-with-session-kill.txt
+grep -qF '~/Library/Application Support/Claude/local-agent-mode-sessions/old' /tmp/mac-reclaim-with-session-kill.txt
+```
+
+Then review the live 4b candidate list and agree with every reason:
+
 Only after reviewing 4b's candidate list and agreeing with every reason:
 
 ```bash
@@ -234,12 +268,14 @@ git bundle verify ~/.local/share/worktree-backups/<name>.bundle
 
 ### 4f. Default roots
 
-`worktree-audit` now probes `~/workspace`, `~/projects`, `~/src`, `~/code` instead of
-assuming `~/workspace`.
+Root precedence is: positional roots, then `WORKTREE_ROOTS`, then common defaults
+(`~/workspace`, `~/projects`, `~/src`, `~/code`). `WORKTREE_ROOTS` constrains the
+scan; it must not fall back to defaults when set, even if the path is missing.
 
 ```bash
-worktree-audit                       # should find repos wherever yours actually live
-WORKTREE_ROOTS=~/some/other/dir worktree-audit
+worktree-audit                       # probes common roots
+WORKTREE_ROOTS=/tmp/definitely-missing-worktree-root worktree-audit
+WORKTREE_ROOTS=/tmp/definitely-missing-worktree-root ./bin/worktree-audit /tmp
 ```
 
 ## 5. Maintain
@@ -251,6 +287,15 @@ git diff --stat      # shows drift, if any, from agent-machine-lib@main
 ```
 
 If `vendor-lib` produces a diff, re-run the section 2 library checks before committing.
+If a fix belongs in shared code, the order is:
+
+1. Fix and push `agent-machine-lib`.
+2. Run `make vendor-lib` in both `mac-optimize` and `wsl-optimize`.
+3. Verify each consumer's `lib/.vendored-from` equals the exact 40-character
+   `agent-machine-lib` commit SHA that was just pushed.
+4. Verify each consumer's vendored `lib/common.sh` and `bin/worktree-audit` bytes
+   match that exact upstream commit.
+5. Push both consumers so all three repositories stay in step.
 
 **Idempotency** — re-running install must actually re-apply, not no-op:
 
@@ -369,3 +414,34 @@ Anything unexpected:
 - `WORKTREE_ROOTS="$HOME/some/other/dir" worktree-audit` previously looked like it worked while still scanning defaults. The fixed behavior now treats `WORKTREE_ROOTS` as the constrained scan root.
 - Historical `diskguard.log` tail includes older `rm: ... .npm/_cacache ... Directory not empty` lines from 2026-07-30, before this verification run.
 ```
+
+### Remaining manual checks from 2026-07-31
+
+The first macOS pass intentionally did not run destructive or interactive cleanup
+against Kyle's live state. To finish the remaining review safely:
+
+```bash
+set -o pipefail
+# 1. Ensure the RunAtLoad diskguard job is idle before measuring a dry-run delta.
+while launchctl list | awk '/com\.mac-optimize\.diskguard/ && $1 != "-" {found=1} END{exit !found}'; do
+  echo "waiting for diskguard to finish…"
+  sleep 5
+done
+
+# 2. Re-run the deep dry-run and review every candidate reason.
+before=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
+./bin/mac-reclaim --deep --dry-run | tee /tmp/mac-optimize-deep-dry-run.txt
+after=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
+echo "delta KiB: $((after-before))    # must be ~0"
+
+# 3. Only after reviewing the dry-run output, run the prompted deep tier.
+mac-reclaim --deep
+
+# 4. Worktree cleanup is separate: audit first, verify one SAFE row, then choose.
+worktree-audit
+worktree-audit --backup     # only if REVIEW rows should be archived
+worktree-audit --prune      # only if SAFE rows should be removed
+```
+
+Do **not** run `mac-reclaim --deep --yes` or `worktree-audit --backup --prune --yes`
+on live state unless the dry-run/audit output has already been reviewed.

@@ -78,7 +78,7 @@ Four principles, in order of trust:
 | `mac-reclaim --deep --dry-run` | Preview deep prune — deletes nothing, prints each candidate + why it's unused. |
 | `mac-reclaim --deep` | Deep prune (prompts). Add `--yes` to skip the prompt (automation). |
 | `mac-reclaim --quiet` | Summary line only. |
-| `worktree-audit [ROOT…]` | Audit stray worktrees (default root `~/workspace`). |
+| `worktree-audit [ROOT…]` | Audit stray worktrees. Precedence: positional `ROOT…`, else `$WORKTREE_ROOTS`, else common roots (`~/workspace`, `~/projects`, `~/src`, `~/code`). |
 | `worktree-audit --prune` | Remove SAFE worktrees + clear stale registrations. |
 | `worktree-audit --backup [--prune]` | Archive REVIEW worktrees to git bundles, then optionally prune the archived ones. |
 
@@ -91,6 +91,7 @@ Four principles, in order of trust:
 | `WARN_GB` | `20` | `diskguard` reclaims + notifies below this. |
 | `CRIT_GB` | `10` | `diskguard` posts an urgent notice below this. |
 | `WORKTREE_BACKUP_DIR` | `~/.local/share/worktree-backups` | Where worktree bundles land. |
+| `WORKTREE_ROOTS` | unset | Constrain `worktree-audit` when no positional roots are passed. If set, defaults are not scanned; a nonexistent path yields no repos instead of falling back. |
 
 Allowlist paths from deep pruning in `~/.config/mac-reclaim/keep.txt` (one substring per line).
 
