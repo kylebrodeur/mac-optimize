@@ -418,11 +418,14 @@ Anything unexpected:
 - Historical `diskguard.log` tail includes older `rm: ... .npm/_cacache ... Directory not empty` lines from 2026-07-30, before this verification run.
 - Operational stability note for gist/writeup: user-observed outcome during this
   macOS run was no significant crash, out-of-memory incident, or Force Quit “apps
-  paused” event. Telemetry snapshot at 20:58 covered a machine up for `1 day,
-  6:19` since `Thu Jul 30 14:39:11 2026`: `memory_pressure -Q` reported `46%`
-  system-wide memory free; `sysctl vm.swapusage` reported `5120.00M` total swap
-  with `4721.75M` used; DiagnosticReports files modified in the last six hours
-  counted `0` crash/IPS, `0` panic-named, and `0` hang/spin-named reports. A
+  paused” event. Telemetry snapshot at `2026-07-31 20:58 CDT (-0500)` covered a
+  machine up for `1 day, 6:19` since `Thu Jul 30 14:39:11 2026`:
+  `memory_pressure -Q` reported `46%` system-wide memory free; `sysctl
+  vm.swapusage` reported `5120.00M` total swap with `4721.75M` used. On macOS,
+  swap-used can include retained pages from earlier transient pressure, so pair it
+  with the contemporaneous memory-free value and do not read it as current OOM.
+  DiagnosticReports files modified in the last six hours counted `0` crash/IPS,
+  `0` panic-named, and `0` hang/spin-named reports. A
   six-hour unified-log scan still showed RunningBoard/memorystatus bookkeeping
   messages, and macOS log retention/filtering is not a complete absence proof.
 ```
