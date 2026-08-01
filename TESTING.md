@@ -433,31 +433,50 @@ Anything unexpected:
 ### Remaining manual checks from 2026-07-31
 
 The first macOS pass intentionally did not run destructive or interactive cleanup
-against Kyle's live state. To finish the remaining review safely:
+against Kyle's live state. Finish the remaining review in separate steps; do not
+paste a dry-run and deletion command together.
+
+1. Wait for `diskguard` to be idle, then capture a measured deep dry-run:
 
 ```bash
 (
 set -euo pipefail
-# 1. Ensure the RunAtLoad diskguard job is idle before measuring a dry-run delta.
 while launchctl list | awk '/com\.mac-optimize\.diskguard/ && $1 != "-" {found=1} END{exit !found}'; do
   echo "waiting for diskguard to finish…"
   sleep 5
 done
 
-# 2. Re-run the deep dry-run and review every candidate reason.
 before=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
 ./bin/mac-reclaim --deep --dry-run | tee /tmp/mac-optimize-deep-dry-run.txt
 after=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
 echo "delta KiB: $((after-before))    # must be ~0"
-
-# 3. Only after reviewing the dry-run output, run the prompted deep tier.
-mac-reclaim --deep
-
-# 4. Worktree cleanup is separate: audit first, verify one SAFE row, then choose.
-worktree-audit
-worktree-audit --backup     # only if REVIEW rows should be archived
-worktree-audit --prune      # only if SAFE rows should be removed
 )
+```
+
+Stop here and review `/tmp/mac-optimize-deep-dry-run.txt`. Continue only if every
+candidate reason is understood and the delta is approximately zero.
+
+2. If the deep dry-run is accepted, run the prompted deep tier:
+
+```bash
+mac-reclaim --deep
+```
+
+3. Worktree cleanup is separate. Audit first:
+
+```bash
+worktree-audit
+```
+
+Then verify one SAFE row as described in §4e. After that, choose only the
+operation you intend:
+
+```bash
+worktree-audit --backup     # only if REVIEW rows should be archived
+```
+
+```bash
+worktree-audit --prune      # only if SAFE rows should be removed
 ```
 
 Do **not** run `mac-reclaim --deep --yes` or `worktree-audit --backup --prune --yes`
