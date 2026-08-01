@@ -11,7 +11,7 @@
 # never auto-removed. This is the check the naive `git worktree remove` skips.
 #
 # Usage:
-#   worktree-audit [ROOT ...]        audit worktrees under ROOTs (default: ~/workspace)
+#   worktree-audit [ROOT ...]        audit ROOTs; else $WORKTREE_ROOTS; else common roots
 #   worktree-audit --prune           remove the SAFE ones (prompts; --yes to skip)
 #   worktree-audit --backup          archive REVIEW worktrees to git bundles, then
 #                                    they're safe to prune (select which; --yes = all)
@@ -59,12 +59,18 @@ _AM_LIB_PATH="$(_am_find_lib)" || {
 . "$_AM_LIB_PATH"
 
 
-# Default search root differs by platform convention. Override by passing ROOTs.
+# Default search roots differ by platform convention. Positional ROOTs override
+# everything; WORKTREE_ROOTS constrains the scan when set; otherwise probe common
+# workspace locations.
 if [ "${#ROOTS[@]}" -eq 0 ]; then
-  for _d in "${WORKTREE_ROOTS:-}" "$HOME/workspace" "$HOME/projects" "$HOME/src" "$HOME/code"; do
-    [ -n "$_d" ] && [ -d "$_d" ] && ROOTS+=("$_d")
-  done
-  [ "${#ROOTS[@]}" -eq 0 ] && ROOTS=("$HOME")
+  if [ -n "${WORKTREE_ROOTS:-}" ]; then
+    ROOTS=("$WORKTREE_ROOTS")
+  else
+    for _d in "$HOME/workspace" "$HOME/projects" "$HOME/src" "$HOME/code"; do
+      [ -d "$_d" ] && ROOTS+=("$_d")
+    done
+    [ "${#ROOTS[@]}" -eq 0 ] && ROOTS=("$HOME")
+  fi
 fi
 BACKUP_DIR="${WORKTREE_BACKUP_DIR:-$HOME/.local/share/worktree-backups}"
 

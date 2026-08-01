@@ -40,8 +40,17 @@ lint:
 # Refresh the vendored shared library + shared tool from agent-machine-lib.
 # Vendored rather than submoduled because this repo promises zero dependencies.
 vendor-lib:
-	@curl -fsSL https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/main/lib/common.sh \
-		-o lib/common.sh
-	@curl -fsSL https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/main/bin/worktree-audit \
-		-o bin/worktree-audit && chmod +x bin/worktree-audit
-	@echo "refreshed lib/common.sh + bin/worktree-audit from agent-machine-lib@main"
+	@set -e; \
+	sha=$$(git ls-remote https://github.com/kylebrodeur/agent-machine-lib.git refs/heads/main | awk '{print $$1}'); \
+	test -n "$$sha"; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	curl -fsSL "https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/$$sha/lib/common.sh" \
+		-o "$$tmp/common.sh"; \
+	curl -fsSL "https://raw.githubusercontent.com/kylebrodeur/agent-machine-lib/$$sha/bin/worktree-audit" \
+		-o "$$tmp/worktree-audit"; \
+	chmod +x "$$tmp/worktree-audit"; \
+	mv "$$tmp/common.sh" lib/common.sh; \
+	mv "$$tmp/worktree-audit" bin/worktree-audit; \
+	printf '%s\n' "$$sha" > lib/.vendored-from; \
+	echo "refreshed lib/common.sh + bin/worktree-audit from agent-machine-lib@$$sha"
