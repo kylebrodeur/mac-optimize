@@ -2,7 +2,8 @@
 
 **Audience:** an AI coding agent running on Kyle's Mac.
 **Written by:** an agent working on the WSL2 side, which could not run macOS code.
-**Delete this file once the verification lands.** It documents a temporary state.
+**Delete this file once the remaining manual deep-tier review lands.** It documents
+a temporary state.
 
 ---
 
@@ -13,11 +14,16 @@
 shared copy was then **fixed** — so for a while this repo held the older, buggier
 versions of code it had donated. The adoption commit closed that inversion.
 
-That work was done on WSL2. It is **statically verified only**: everything parses,
-the library loads, platform detection is correct, and the resolver finds the
-library from a checkout. Nothing was *executed* on macOS.
+That WSL2 work has now been exercised on macOS. See `TESTING.md`'s
+“Results — 2026-07-31 macOS verification” section for command-level results.
+The macOS run found and fixed a shared `WORKTREE_ROOTS` safety bug in
+`agent-machine-lib`, re-vendored the fix into both `mac-optimize` and
+`wsl-optimize`, and reinstalled the fixed macOS tools.
 
-Your job: run it, review it, fix what breaks, report.
+Remaining work: rerun §4b once `diskguard` is idle and the deep candidate scan
+completes, then have Kyle review the §4d deep-tier candidates before any real
+deep deletion. The destructive/interactive §4d and §4e prune/backup flows were
+intentionally skipped; do not treat them as passed.
 
 ## 2. What changed, precisely
 

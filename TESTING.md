@@ -155,8 +155,15 @@ snapshots. Deletes nothing. Note the reported free space.
 ### 4b. Safe tier — dry-run, and assert it frees nothing
 
 The safe tier previously *skipped* itself under `--dry-run`; it now reports intent.
+`make install` also loads `diskguard` with `RunAtLoad`; on a low-disk machine that
+can start a real safe reclaim concurrently. Wait until `diskguard` is idle before
+measuring free-space deltas, or a correct dry-run can appear to free GiB.
 
 ```bash
+while launchctl list | awk '/com\.mac-optimize\.diskguard/ && $1 != "-" {found=1} END{exit !found}'; do
+  echo "waiting for diskguard to finish…"
+  sleep 5
+done
 before=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
 ./bin/mac-reclaim --deep --dry-run
 after=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
@@ -167,7 +174,8 @@ echo "delta KiB: $((after-before))    # must be ~0"
 with a reason, and `delta ≈ 0` (small noise from other processes is fine; hundreds of
 MiB is not).
 
-**STOP if:** delta is materially negative — a dry-run deleted something.
+**STOP if:** delta is materially nonzero — especially positive, because increased free
+space means something deleted data during what should have been a dry-run.
 
 Also confirm the shared tier actually ran (this is the behaviour change):
 
@@ -327,3 +335,37 @@ Anything unexpected:
 ```
 
 Report failures with the exact command, its full output, and which STOP check tripped.
+
+## Results — 2026-07-31 macOS verification
+
+```
+macOS:            26.5.2 (25F84)
+bash:             GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
+free space before: 17Gi at prerequisite check; 19Gi at diskreport after install-triggered reclaim
+free space after 4c: 21Gi
+
+2  parse                 pass
+2  library isolation     AM_PLATFORM=macos  am_mtime=1785542320  am_idle_days=0
+2  am_stale_entries      keep0 listed old? Y   keep5 empty? Y
+3  make install          pass
+3  make doctor           passed=9   failed=0
+3a installed vs repo     counts match? Y (installed=5 repo=5)
+4a diskreport            ran clean? Y
+4b dry-run delta KiB     inconclusive under launchd race: +2160348, then +1659184
+4b shared tier shown?    Y   brew shown in real env; bun shown with dry-run no-op bun shim
+4c mac-reclaim reclaimed 712 MiB; immediate rerun reclaimed 1 MiB
+4d deep tier             candidates=123  accepted=0 (skipped pending human review)
+4e worktree-audit        SAFE=3   REVIEW=0   hand-verified a SAFE row? Y
+4e backup round-trip     bundle verify pass? skipped (no backup flow used)
+5  vendor-lib drift      fixed: marker and bytes now match agent-machine-lib@f5a959b0fe635a27ceb402cee3f9595dbae22db7
+5  install idempotent    Y (diskguard PID 39726 -> 40441 -> 40482)
+6  uninstall residue     bins=0  lib=0  agents=0  plists=0; tools reinstalled afterward
+
+Anything unexpected:
+- Found and fixed a shared `WORKTREE_ROOTS` safety bug: env roots were additive with default roots, so an explicit constrained root or nonexistent root could still scan default roots. Fixed in `agent-machine-lib`, added regression coverage for env root, nonexistent env root, and positional-root precedence, then re-vendored `mac-optimize` and `wsl-optimize`.
+- The real environment lacks `bun`, so the literal `would: bun pm cache rm` branch was verified with a temporary no-op `bun` shim; dry-run did not invoke the shim.
+- `make install` starts `diskguard` with `RunAtLoad`; while disk was below the warning threshold it ran real safe reclaim concurrently with §4b dry-run measurements. TESTING.md now requires waiting for `diskguard` to go idle before delta measurement.
+- A later deep dry-run attempt hung in the candidate scan and was killed (`bash ./bin/mac-reclaim --deep --dry-run`, pid 43932). Do not treat §4b delta verification as clean until rerun after `diskguard` is idle and the scan completes.
+- `WORKTREE_ROOTS="$HOME/some/other/dir" worktree-audit` previously looked like it worked while still scanning defaults. The fixed behavior now treats `WORKTREE_ROOTS` as the constrained scan root.
+- Historical `diskguard.log` tail includes older `rm: ... .npm/_cacache ... Directory not empty` lines from 2026-07-30, before this verification run.
+```
