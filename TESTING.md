@@ -31,8 +31,9 @@ df -h /System/Volumes/Data | tail -1   # note free space BEFORE anything
 ```
 
 **STOP if:** `python3` or `lsof` is missing. The deep tier's orphan detection needs
-`python3`; `lsof` is the open-file guard, and without it `am_in_use` deliberately
-reports "in use" for everything (safe, but the deep tier will find no candidates).
+`python3`; `lsof` is the open-file guard. The implementation also fails closed at
+runtime: a missing, failing, or diagnostic `lsof` check protects the candidate and
+does not treat the check as proof that the path is closed.
 
 Record: macOS version, bash version, free space.
 

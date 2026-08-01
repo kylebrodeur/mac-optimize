@@ -25,10 +25,24 @@ cat > "$FAKE_BIN/lsof" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *4444444444444444*) exit 0 ;;
-  *) exit 1 ;;
+  *)
+    if [ "${LSOF_FAIL:-0}" = 1 ]; then
+      printf 'lsof: simulated traversal failure\n' >&2
+      exit 1
+    fi
+    exit 1 ;;
 esac
 EOF
 chmod +x "$FAKE_BIN/lsof"
+
+# Keep --yes runs isolated from real cache commands.
+for tool in pnpm uv npm pip go cargo-cache brew bun agent-session-kill; do
+  cat > "$FAKE_BIN/$tool" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$FAKE_BIN/$tool"
+done
 
 # Fixture 1: orphan containing live-looking VS Code state (chat sessions).
 WS1_ID="1111111111111111"
@@ -151,6 +165,42 @@ classify_fixture "$REL_WS1" "chat-bearing orphan"
 classify_fixture "$REL_WS4" "open orphan"
 classify_fixture "$REL_WS2" "unknown-file orphan"
 classify_fixture "$REL_WS3" "state.vscdb-only orphan"
+
+OPEN_CHECK_FIXTURE="$TMP_HOME/Library/Application Support/Claude/vm_bundles/open-check-unavailable"
+REL_OPEN="~/Library/Application Support/Claude/vm_bundles/open-check-unavailable"
+mkdir -p "$OPEN_CHECK_FIXTURE"
+touch -t 202401010000 "$OPEN_CHECK_FIXTURE"
+FAIL_OUT=$(LSOF_FAIL=1 KEEP_DAYS=0 KEEP_RECENT=0 PATH="$FAKE_BIN:$PATH" "$REPO_ROOT/bin/mac-reclaim" --deep --dry-run 2>&1)
+DELETE_SECTION=$(printf '%s\n' "$FAIL_OUT" | sed -n '/^Deletion candidates:/,$p')
+if ! printf '%s\n' "$FAIL_OUT" | grep -Fq "open-file check unavailable"; then
+  echo "FAIL: unavailable lsof check was not reported"
+  fail=1
+elif printf '%s\n' "$DELETE_SECTION" | grep -Fq "$REL_OPEN"; then
+  echo "FAIL: unavailable lsof check exposed an idle deletion candidate"
+  printf '%s\n' "$DELETE_SECTION"
+  fail=1
+else
+  echo "PASS: unavailable lsof check protected idle deep-tier state"
+fi
+
+FAIL_YES_OUT=$(LSOF_FAIL=1 KEEP_DAYS=0 KEEP_RECENT=0 PATH="$FAKE_BIN:$PATH" "$REPO_ROOT/bin/mac-reclaim" --deep --yes 2>&1)
+if [ ! -d "$OPEN_CHECK_FIXTURE" ] || ! printf '%s\n' "$FAIL_YES_OUT" | grep -Fq "open-file check unavailable"; then
+  echo "FAIL: --yes removed or failed to report unavailable open-check state"
+  fail=1
+else
+  echo "PASS: --yes retained state when open-file check was unavailable"
+fi
+
+CONTROL_FIXTURE="$TMP_HOME/Library/Application Support/Claude/vm_bundles/closed-control"
+mkdir -p "$CONTROL_FIXTURE"
+touch -t 202401010000 "$CONTROL_FIXTURE"
+KEEP_DAYS=0 KEEP_RECENT=0 PATH="$FAKE_BIN:$PATH" "$REPO_ROOT/bin/mac-reclaim" --deep --yes >/dev/null 2>&1
+if [ -e "$CONTROL_FIXTURE" ] || [ -L "$CONTROL_FIXTURE" ]; then
+  echo "FAIL: confirmed-closed control candidate was not removed"
+  fail=1
+else
+  echo "PASS: confirmed-closed control candidate was removed"
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo ""

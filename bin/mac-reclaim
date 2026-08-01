@@ -83,10 +83,20 @@ is_allowlisted() {                     # $1=path ; true if matches any keep.txt 
   done <"$KEEPFILE"
   return 1
 }
-dir_open() {                           # $1=path ; true if a process has it open
-  command -v lsof >/dev/null 2>&1 || return 1
-  lsof -- "$1" >/dev/null 2>&1 && return 0
-  lsof +D "$1" >/dev/null 2>&1        # deep check (bundles hold an open disk image)
+dir_open() {                           # $1=path; 0=open, 1=closed, 2=check unavailable
+  command -v lsof >/dev/null 2>&1 || return 2
+  local err rc
+  err=$(lsof -- "$1" 2>&1 >/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -ne 1 ] && return 2
+  [ -n "$err" ] && return 2
+  err=$(lsof +D "$1" 2>&1 >/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -ne 1 ] && return 2
+  [ -n "$err" ] && return 2
+  return 1
 }
 ws_folder_status() {                   # echoes: orphan | alive | unknown
   local js="$1/workspace.json" p
@@ -160,8 +170,12 @@ if [ "$DEEP" = 1 ]; then
       is_allowlisted "$d" && continue
       st=$(ws_folder_status "$d")
       if [ "$st" = orphan ]; then
-        if dir_open "$d"; then
+        dir_open "$d"
+        open_rc=$?
+        if [ "$open_rc" -eq 0 ]; then
           add_review "$d" "review: in use/open (archive before removal)"
+        elif [ "$open_rc" -eq 2 ]; then
+          add_review "$d" "review: open-file check unavailable (archive before removal)"
         else
           add_review "$d" "$(ws_review_reason "$d")"
         fi
@@ -190,8 +204,14 @@ if [ "$DEEP" = 1 ]; then
       [ "$idx" -le "$KEEP_RECENT" ] && continue
       is_allowlisted "$d" && continue
       # idle > KEEP_DAYS and not currently open
-      if [ -n "$(find "$d" -maxdepth 0 -mtime +"$KEEP_DAYS" 2>/dev/null)" ] && ! dir_open "$d"; then
-        add "$d" "idle >${KEEP_DAYS}d, rank #$idx"
+      if [ -n "$(find "$d" -maxdepth 0 -mtime +"$KEEP_DAYS" 2>/dev/null)" ]; then
+        dir_open "$d"
+        open_rc=$?
+        if [ "$open_rc" -eq 1 ]; then
+          add "$d" "idle >${KEEP_DAYS}d, rank #$idx"
+        elif [ "$open_rc" -eq 2 ]; then
+          say "  · skip: open-file check unavailable $d"
+        fi
       fi
     done < <(ls -dt "$base"/*/ 2>/dev/null | sed 's:/$::')
   done
@@ -223,8 +243,31 @@ if [ "$DEEP" = 1 ]; then
         [ "$ans" = y ] || [ "$ans" = Y ] || ok=0
       fi
       if [ "$ok" = 1 ]; then
-        for d in "${DELETE[@]}"; do rm -rf "$d"; done
-        logline "deep: removed ${#DELETE[@]} proven-unused entries"
+        removed=0
+        for d in "${DELETE[@]}"; do
+          if [ ! -d "$d" ] || [ -L "$d" ] || is_allowlisted "$d"; then
+            say "  · skip: candidate changed or is allowlisted $d"
+            continue
+          fi
+          if [ -z "$(find "$d" -maxdepth 0 -mtime +"$KEEP_DAYS" 2>/dev/null)" ]; then
+            say "  · skip: candidate is no longer idle $d"
+            continue
+          fi
+          dir_open "$d"
+          open_rc=$?
+          if [ "$open_rc" -eq 1 ]; then
+            if rm -rf -- "$d" && [ ! -e "$d" ] && [ ! -L "$d" ]; then
+              removed=$((removed+1))
+            else
+              say "  · removal failed; retained $d"
+            fi
+          elif [ "$open_rc" -eq 0 ]; then
+            say "  · skip: candidate became in use/open $d"
+          else
+            say "  · skip: open-file check unavailable $d"
+          fi
+        done
+        logline "deep: removed $removed proven-unused entries"
       else say "  skipped."; fi
     fi
   fi
