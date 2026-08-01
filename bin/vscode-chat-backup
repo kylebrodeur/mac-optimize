@@ -59,14 +59,28 @@ def _now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _sha256_file(path):
+def _sha256_file(path, expected_stat=None):
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ManifestError(f"tree_fingerprint: cannot open file entry {path}: {e}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ManifestError(f"tree_fingerprint: opened entry is not a regular file: {path}")
+        if expected_stat is not None:
+            if (st.st_dev, st.st_ino) != (expected_stat.st_dev, expected_stat.st_ino):
+                raise ManifestError(
+                    f"tree_fingerprint: file identity changed between lstat and open: {path}"
+                )
         while True:
-            chunk = f.read(65536)
+            chunk = os.read(fd, 65536)
             if not chunk:
                 break
             h.update(chunk)
+    finally:
+        os.close(fd)
     return h.hexdigest()
 
 
@@ -81,8 +95,12 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
     basename of *root*. Records are emitted and sorted by raw bytes (not locale).
     """
     root = Path(root)
-    if not root.is_dir():
-        raise ManifestError(f"tree_fingerprint: not a directory: {root}")
+    try:
+        root_st = os.lstat(root)
+    except OSError as e:
+        raise ManifestError(f"tree_fingerprint: cannot lstat root {root}: {e}")
+    if not stat.S_ISDIR(root_st.st_mode):
+        raise ManifestError(f"tree_fingerprint: root is not a directory: {root}")
 
     workspace_hash = root.name
     if not workspace_hash:
@@ -95,7 +113,10 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
     regular_file_count = 0
     regular_bytes = 0
 
-    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+    def _on_walk_error(exc):
+        raise ManifestError(f"tree_fingerprint: cannot traverse directory {exc.filename}: {exc}")
+
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False, onerror=_on_walk_error):
         dirnames.sort(key=lambda n: os.fsencode(n))
         filenames.sort(key=lambda n: os.fsencode(n))
 
@@ -111,19 +132,32 @@ def tree_fingerprint(root: Path) -> SnapshotFingerprint:
             dir_path_bytes = workspace_hash_bytes + b"/"
         records.append((dir_path_bytes + b"\x00", None))
 
+        for dn in dirnames:
+            dp = Path(dirpath) / dn
+            try:
+                st = os.lstat(dp)
+            except OSError as e:
+                raise ManifestError(f"tree_fingerprint: cannot lstat directory entry {dp}: {e}")
+            if not stat.S_ISDIR(st.st_mode):
+                raise ManifestError(
+                    f"tree_fingerprint: directory entry is not a directory: {dp}"
+                )
+
         for fn in filenames:
             fp = Path(dirpath) / fn
             try:
                 st = os.lstat(fp)
             except OSError as e:
-                raise ManifestError(f"tree_fingerprint: cannot stat {fp}: {e}")
+                raise ManifestError(f"tree_fingerprint: cannot lstat file entry {fp}: {e}")
             if not stat.S_ISREG(st.st_mode):
-                continue
+                raise ManifestError(
+                    f"tree_fingerprint: file entry is not a regular file: {fp}"
+                )
 
             rel_file = rel_dir / fn if rel_dir != Path(".") else Path(fn)
             rel_file_bytes = os.fsencode(rel_file.as_posix())
             file_path_bytes = workspace_hash_bytes + b"/" + rel_file_bytes
-            content_hash = _sha256_file(fp)
+            content_hash = _sha256_file(fp, st)
             size = st.st_size
             regular_file_count += 1
             regular_bytes += size

@@ -74,6 +74,71 @@ mkdir "$WSROOT/state.vscdb"
 DIR_VERSION=$("$CLI" tree-fingerprint "$WSROOT" | json_field fingerprint)
 expect_ne "$DIR_VERSION" "$RUN1" "file replaced by directory changes fingerprint"
 
+# ── special entries fail closed ─────────────────────────────────────────────
+# Symlink/FIFO/socket entries must abort fingerprinting, not be silently skipped.
+SPHASH="a"
+SPROOT="$TMP_HOME/$SPHASH"
+mkdir -p "$SPROOT/subdir"
+printf '{"a":1}\n' > "$SPROOT/regular.json"
+printf '{"b":2}\n' > "$SPROOT/subdir/nested.json"
+
+CLEAN_FP=$("$CLI" tree-fingerprint "$SPROOT" | json_field fingerprint)
+if [ -n "$CLEAN_FP" ]; then
+  echo "PASS: clean special-entry workspace succeeds before injection"
+else
+  echo "FAIL: clean special-entry workspace did not fingerprint"
+  fail=1
+fi
+
+ROOT_LINK="$TMP_HOME/deadbeef"
+ln -s "$SPROOT" "$ROOT_LINK"
+if "$CLI" tree-fingerprint "$ROOT_LINK" >/dev/null 2>&1; then
+  echo "FAIL: tree_fingerprint accepted symlink root"
+  fail=1
+else
+  echo "PASS: tree_fingerprint rejects symlink root"
+fi
+rm "$ROOT_LINK"
+
+ln -s regular.json "$SPROOT/link.json"
+if "$CLI" tree-fingerprint "$SPROOT" >/dev/null 2>&1; then
+  echo "FAIL: tree_fingerprint accepted file symlink"
+  fail=1
+else
+  echo "PASS: tree_fingerprint rejects file symlink"
+fi
+rm "$SPROOT/link.json"
+
+ln -s subdir "$SPROOT/linkdir"
+if "$CLI" tree-fingerprint "$SPROOT" >/dev/null 2>&1; then
+  echo "FAIL: tree_fingerprint accepted directory symlink"
+  fail=1
+else
+  echo "PASS: tree_fingerprint rejects directory symlink"
+fi
+rm "$SPROOT/linkdir"
+
+mkfifo "$SPROOT/fifo"
+if "$CLI" tree-fingerprint "$SPROOT" >/dev/null 2>&1; then
+  echo "FAIL: tree_fingerprint accepted FIFO"
+  fail=1
+else
+  echo "PASS: tree_fingerprint rejects FIFO"
+fi
+rm "$SPROOT/fifo"
+
+if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.bind(sys.argv[1]); s.close()' "$SPROOT/socket" 2>/dev/null; then
+  if "$CLI" tree-fingerprint "$SPROOT" >/dev/null 2>&1; then
+    echo "FAIL: tree_fingerprint accepted Unix domain socket"
+    fail=1
+  else
+    echo "PASS: tree_fingerprint rejects Unix domain socket"
+  fi
+  rm -f "$SPROOT/socket"
+else
+  echo "SKIP: Unix domain socket not available"
+fi
+
 # ── canonical source path ───────────────────────────────────────────────────
 VALID_HASH="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 VALID_SRC=$("$CLI" canonical-source-path "$VALID_HASH")
