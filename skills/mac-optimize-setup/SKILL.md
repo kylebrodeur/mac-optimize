@@ -1,6 +1,6 @@
 ---
 name: mac-optimize-setup
-description: Install and configure the mac-optimize disk and shell hygiene toolset on a macOS machine, including the launchd automation (a low-disk watcher plus a weekly reclaim) and optionally moving a 1Password service-account token out of a cleartext dotfile into the login Keychain. Use when setting up a new Mac, when the user says "install mac-optimize", "set up disk automation", or "set up the disk cleanup tools", or when uninstalling them.
+description: Install and configure the mac-optimize disk and shell hygiene toolset on a macOS machine, including the launchd automation (a low-disk watcher, a memory-pressure watcher, and a weekly reclaim) and optionally moving a 1Password service-account token out of a cleartext dotfile into the login Keychain. Use when setting up a new Mac, when the user says "install mac-optimize", "set up disk automation", or "set up the disk cleanup tools", or when uninstalling them.
 compatibility: Requires macOS, git, and a checkout of the mac-optimize repo. Homebrew, pnpm, uv, and nvm are optional (their caches are only pruned if present).
 license: MIT
 metadata:
@@ -10,7 +10,7 @@ metadata:
 
 # mac-optimize-setup
 
-Install the mac-optimize tooling (`diskreport`, `mac-reclaim`, `worktree-audit`, `diskguard`) and its launchd automation onto a Mac.
+Install the mac-optimize tooling (`diskreport`, `mac-reclaim`, `worktree-audit`, `diskguard`, `memguard`) and its launchd automation onto a Mac.
 
 ## Install
 
@@ -21,16 +21,16 @@ git pull            # if already cloned
 make install
 ```
 
-`install.sh` is idempotent. It copies `bin/*` to `~/.local/bin` (make sure that's on `PATH`), installs the two launchd plists to `~/Library/LaunchAgents`, and (re)loads them.
+`install.sh` is idempotent. It copies `bin/*` to `~/.local/bin` (make sure that's on `PATH`), installs the three launchd plists to `~/Library/LaunchAgents`, and (re)loads them.
 
 ## Verify
 
 ```
-launchctl list | grep mac-optimize    # expect com.mac-optimize.diskguard and .mac-reclaim
+launchctl list | grep mac-optimize    # expect com.mac-optimize.diskguard, .memguard, and .mac-reclaim
 diskreport                            # confirm the tools resolve on PATH
 ```
 
-`diskguard` runs at login and every 3 hours; if free space drops below 20 GB it runs a safe reclaim and posts a notification (urgent notice, no auto-delete, below 10 GB). `mac-reclaim` runs a safe reclaim weekly.
+`diskguard` runs at login and every 3 hours; if free space drops below 20 GB it runs a safe reclaim and posts a notification (urgent notice, no auto-delete, below 10 GB). `memguard` runs at login and every 5 minutes; it watches the kernel memory-pressure level and free RAM and, when memory is tight, posts a notification naming the largest process (it never kills or deletes anything). `mac-reclaim` runs a safe reclaim weekly.
 
 **One-time macOS permission:** the first low-disk notification may need Notification Center permission for `osascript`/Script Editor (System Settings → Notifications). The reclaim still runs regardless; only the banner is gated.
 
@@ -52,7 +52,7 @@ The `-T /usr/bin/security` grant lets the shell read it at startup without a pro
 ## Uninstall
 
 ```
-make uninstall      # bootout both launchd agents, remove plists + deployed scripts
+make uninstall      # bootout the launchd agents, remove plists + deployed scripts
 ```
 
 The repo (source of truth) is left intact.
