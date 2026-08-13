@@ -102,7 +102,7 @@ make install
 ```
 
 **Expect:** scripts copied to `~/.local/bin`, `lib/common.sh` installed to
-`~/.local/lib/mac-optimize/`, and two launchd agents loaded.
+`~/.local/lib/mac-optimize/`, and three launchd agents loaded (diskguard, memguard, mac-reclaim).
 
 ```bash
 make doctor
@@ -292,6 +292,42 @@ WORKTREE_ROOTS=/tmp/definitely-missing-worktree-root worktree-audit
 WORKTREE_ROOTS=/tmp/definitely-missing-worktree-root ./bin/worktree-audit /tmp
 ```
 
+### 4g. Memory watcher (memguard) and diskguard escalation
+
+`memguard` is the memory analog of `diskguard` — a launchd watcher (login + every
+5 min) that reads the kernel memory-pressure level and free-RAM %, names the
+largest RAM consumer, and **never kills or deletes**. Force each state via
+thresholds so no real pressure is needed:
+
+```bash
+memguard; tail -1 ~/Library/Logs/memguard.log                         # logs `ok` at pressure L1, `WARN` at L2 — both correct
+FREE_WARN_PCT=100 CRIT_GB=0   memguard; tail -1 ~/Library/Logs/memguard.log   # WARN (RAM in band, disk not aggravating)
+FREE_WARN_PCT=100 CRIT_GB=999 memguard; tail -1 ~/Library/Logs/memguard.log   # CRITICAL (disk<->swap coupling)
+FREE_CRIT_PCT=100             memguard; tail -1 ~/Library/Logs/memguard.log   # CRITICAL (free-RAM floor)
+sysctl kern.memorystatus_vm_pressure_level                            # authoritative signal: 1 normal / 2 warn / 4 crit
+```
+
+**Expect:** the plain run's level tracks `kern.memorystatus_vm_pressure_level` — `ok`
+at L1, `WARN` at L2 (a memory-tight-but-idle box legitimately sits at L2). Swap is
+deliberately NOT a trigger (it sits ~80% whenever swap was ever touched, so it would
+false-alarm); it is shown as `used/totalMB`. Forced runs log `WARN`/`CRITICAL` with
+the largest process named.
+**STOP if:** it logs `CRITICAL` while the kernel reports L1/normal and free RAM is
+healthy, or memguard ever kills a process.
+
+**diskguard escalation.** When the safe tier can't restore headroom diskguard names
+the biggest disk consumers, flags the safe tier exhausted, points at the deep tools,
+and debounces repeat banners. Force the critical path (safe reclaim only — deletes
+nothing destructive):
+
+```bash
+WARN_GB=9999 CRIT_GB=9999 diskguard; tail -2 ~/Library/Logs/diskguard.log
+```
+
+**Expect:** a `CRITICAL:` line naming the top fillers (e.g. workspaceStorage,
+vm_bundles) plus `mac-reclaim --deep --dry-run` guidance; `~/Library/Logs/diskguard.log.state`
+records the level so the banner is not re-posted every run.
+
 ## 5. Maintain
 
 ```bash
@@ -323,10 +359,11 @@ was satisfied by "already running" and silently ignored a changed unit. `install
 here does `launchctl bootout` then `bootstrap`, which is correct — but verify the
 agents are actually reloaded (check their PIDs change) rather than assuming.
 
-Automation: `diskguard` at login + every 3 h, `mac-reclaim` weekly Sundays 11:00.
+Automation: `diskguard` at login + every 3 h, `memguard` at login + every 5 min, `mac-reclaim` weekly Sundays 11:00.
 
 ```bash
 tail -20 ~/Library/Logs/diskguard.log
+tail -20 ~/Library/Logs/memguard.log
 tail -20 ~/Library/Logs/mac-reclaim.log
 ```
 
