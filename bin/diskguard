@@ -10,6 +10,10 @@
 # Env thresholds (GB of free space on the Data volume):
 #   WARN_GB=20   below this -> run safe reclaim + notify
 #   CRIT_GB=10   still below this after reclaim -> urgent notify, no auto-delete
+#   When the safe tier can't restore headroom, diskguard NAMES the biggest disk
+#   consumers, flags the safe tier as exhausted, points at the deep tools, and
+#   debounces repeat banners (escalation or NOTIFY_COOLDOWN) so a chronically
+#   full disk doesn't spam an identical banner every run.
 
 # launchd gives a near-empty environment; bake in the dirs the tools live in so
 # mac-reclaim's `command -v pnpm/uv/brew` guards resolve. Covers Apple Silicon
@@ -22,6 +26,9 @@ WARN_GB="${WARN_GB:-20}"
 CRIT_GB="${CRIT_GB:-10}"
 LOG="$HOME/Library/Logs/diskguard.log"
 mkdir -p "$(dirname "$LOG")"
+AS="$HOME/Library/Application Support"
+STATEF="$LOG.state"
+NOTIFY_COOLDOWN="${NOTIFY_COOLDOWN:-86400}"  # repeat same-level banner at most this often (runs are 3h apart)
 
 free_gb() { df -k "$DATA_VOL" | awk 'NR==2{printf "%d", $4/1024/1024}'; }
 logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
@@ -30,25 +37,61 @@ notify()  {  # $1=title  $2=message ; non-blocking, never a modal dialog
   /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
 }
 
+# The dirs that actually balloon during agent runs (diskreport's REVIEW tier +
+# the heaviest regrowing caches). One `du` per known dir — no full-tree walk —
+# then the three biggest, ~-relative. Only called when already critical.
+top_fillers() {
+  local c
+  for c in \
+    "$AS/Code/User/workspaceStorage" "$AS/Claude/vm_bundles" \
+    "$AS/Claude/local-agent-mode-sessions" "$HOME/.claude/projects" \
+    "$HOME/Library/Caches" "$HOME/.npm" "$HOME/Library/pnpm" "$HOME/.cache" "$HOME/.bun"; do
+    [ -d "$c" ] && du -sk "$c" 2>/dev/null
+  done | sort -rn | head -3 | awk -v h="$HOME" '{sz=$1; p=substr($0,index($0,$2)); gsub(h,"~",p); printf "%.1fGB %s; ", sz/1024/1024, p}'
+}
+
 BEFORE=$(free_gb)
+state=ok; AFTER=$BEFORE; warn_msg=""; crit_msg=""
 
 if [ "$BEFORE" -ge "$WARN_GB" ]; then
   logline "ok: ${BEFORE}GB free (>= WARN ${WARN_GB}GB), no action"
 else
   logline "low: ${BEFORE}GB free (< WARN ${WARN_GB}GB) -> safe reclaim"
-  # SAFE tier only — never --deep unattended.
+  # SAFE tier only — never --deep unattended. It rarely restores full headroom,
+  # but it's what keeps a chronically-full disk from hitting zero, so it always runs.
   if command -v mac-reclaim >/dev/null 2>&1; then mac-reclaim --quiet >>"$LOG" 2>&1
   else "$HOME/.local/bin/mac-reclaim" --quiet >>"$LOG" 2>&1; fi
   AFTER=$(free_gb)
   RECLAIMED_MB=$(( (AFTER - BEFORE) * 1024 ))
   logline "reclaim done: ${BEFORE}GB -> ${AFTER}GB (~${RECLAIMED_MB}MB)"
-  notify "diskguard: reclaimed space" "Was ${BEFORE}GB free, now ${AFTER}GB (~${RECLAIMED_MB}MB). Threshold ${WARN_GB}GB."
   if [ "$AFTER" -lt "$CRIT_GB" ]; then
-    logline "CRITICAL: ${AFTER}GB free (< CRIT ${CRIT_GB}GB) after reclaim"
-    notify "diskguard: still critically low (${AFTER}GB)" \
-      "Safe reclaim wasn't enough. Run in Terminal: diskreport, then mac-reclaim --deep --dry-run, then worktree-audit."
+    state=crit
+    fillers="$(top_fillers)"; fillers="${fillers:-unknown}"
+    exhausted=""
+    [ "$RECLAIMED_MB" -lt 512 ] && exhausted=" Safe tier nearly exhausted (only ${RECLAIMED_MB}MB freed) — caches can't win against real state."
+    logline "CRITICAL: ${AFTER}GB free (< CRIT ${CRIT_GB}GB) after reclaim.${exhausted} Biggest: ${fillers}"
+    crit_msg="Safe reclaim can't restore headroom (${AFTER}GB free).${exhausted} Biggest: ${fillers}Reclaim for real: mac-reclaim --deep --dry-run, then worktree-audit --backup."
+  else
+    state=warn
+    warn_msg="Was ${BEFORE}GB free, now ${AFTER}GB (~${RECLAIMED_MB}MB). Threshold ${WARN_GB}GB."
   fi
 fi
+
+# Debounce banners: log every run, but only notify on escalation or after the
+# cooldown — a chronically full disk shouldn't post the same banner every cycle.
+rank(){ case "$1" in crit) echo 2;; warn) echo 1;; *) echo 0;; esac; }
+prev_state=ok; prev_notify=0
+[ -f "$STATEF" ] && read -r prev_state prev_notify < "$STATEF" 2>/dev/null
+prev_state=${prev_state:-ok}; prev_notify=${prev_notify:-0}
+now=$(date +%s); last_notify=$prev_notify
+if [ "$state" != ok ] && { [ "$(rank "$state")" -gt "$(rank "$prev_state")" ] || [ $(( now - prev_notify )) -ge "$NOTIFY_COOLDOWN" ]; }; then
+  case "$state" in
+    warn) notify "diskguard: reclaimed space" "$warn_msg" ;;
+    crit) notify "diskguard: still critically low (${AFTER}GB)" "$crit_msg" ;;
+  esac
+  last_notify=$now
+fi
+printf '%s %s\n' "$state" "$last_notify" >"$STATEF"
 
 # self-cap this log (the journald lesson)
 [ -f "$LOG" ] && { tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }

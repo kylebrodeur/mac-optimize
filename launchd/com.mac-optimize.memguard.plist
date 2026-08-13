@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Template: install.sh substitutes __HOME__ and __PATH__ at install time. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mac-optimize.memguard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/memguard</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Memory pressure moves fast; poll every 5 min (diskguard is every 3 h).
+         The check is cheap (sysctl + one memory_pressure sample + one ps) and
+         notifications are debounced, so this is not chatty. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/memguard.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/memguard.launchd.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

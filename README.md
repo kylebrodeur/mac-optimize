@@ -6,9 +6,9 @@
 [![Dependencies: none](https://img.shields.io/badge/deps-none-success.svg)](#requirements)
 [![Agent Skills](https://img.shields.io/badge/Agent%20Skills-agentskills.io-8A2BE2.svg)](https://agentskills.io)
 
-> Disk & shell hygiene for a **Mac that runs a lot of AI coding agents** on limited disk — diagnose, reclaim safely, and audit stray git worktrees, without ever deleting work that isn't provably recoverable.
+> Disk, memory & shell hygiene for a **Mac that runs a lot of AI coding agents** on limited RAM and disk — diagnose, reclaim safely, watch for jetsam-inducing memory pressure, and audit stray git worktrees, without ever deleting work that isn't provably recoverable.
 
-It's a macOS port of a WSL2 optimization writeup. On WSL2 the failure mode was silent OOM (the kernel dismantled the session while protecting the memory hogs); on a 16 GB M1 running fleets of agents, the equivalent slow death is **disk exhaustion** — package caches, agent runtimes, editor workspace state, and stray git worktrees that grow on every run and never self-reclaim.
+It's a macOS port of a WSL2 optimization writeup. On WSL2 the failure mode was silent OOM — the kernel dismantled the session while protecting the memory hogs. A 16 GB Mac running fleets of agents dies two ways: **disk exhaustion** (package caches, agent runtimes, editor workspace state, and stray git worktrees that grow on every run and never self-reclaim) and, closer to the original, **memory pressure** — a fleet of agents (each a heavy process tree that fans out subagents) exhausts RAM + compressor + swap until the kernel's jetsam killer force-quits whatever app it can reach. This toolkit covers both.
 
 The design goal, borrowed from that writeup, is to **change the shape of the failure**: from "silent and fatal" to "observable and bounded." You get a report you can read, a reclaim that's safe by construction, and a watcher that acts at a threshold and tells you what it did.
 
@@ -56,6 +56,7 @@ worktree-audit        # find stray git worktrees
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only with *evidence* they're unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and never removed until an archive-first backup and explicit verified prune workflow exists. |
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
+| **`memguard`** | The memory analog of `diskguard` (the real `earlyoom` port). A launchd watcher at login + every 5 min: it reads the kernel's own memory-pressure level (`kern.memorystatus_vm_pressure_level`) and free-RAM %, and at the warn/critical thresholds posts a non-blocking notification **naming the largest RAM consumer** so you can act before jetsam picks the victim. Escalates when disk is *also* low, since swap can't grow on a full volume. **Never kills or deletes anything** — a memory spike is usually transient, so there's nothing safe to auto-reap; it only observes and warns. |
 | **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
 
 ## How it works
@@ -65,7 +66,7 @@ Four principles, in order of trust:
 1. **Observable before action.** `diskreport` answers "what's using my disk" without touching anything. Diagnose first.
 2. **Safe by construction.** The default `mac-reclaim` only clears caches the owning tool rebuilds on demand — `pnpm`/`uv` prune only *unreferenced* packages; npm's `_cacache` is a re-download cache; installed `node_modules` are never touched. It **cannot** remove something you're using.
 3. **Evidence before deletion.** The deep tier and worktree removal require *proof* an item is disposable: idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects`; a worktree whose every commit is reachable from another branch/tag/remote. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and is **never removed** until an archive-first backup and explicit verified prune workflow exists. Anything unproven is **protected, never deleted.**
-4. **Bounded automation.** `diskguard` runs unattended, but only ever the safe tier, and only at a threshold — turning a silent disk-fill into an observable, self-healing event it logs and notifies about.
+4. **Bounded automation.** `diskguard` runs unattended, but only ever the safe tier, and only at a threshold — turning a silent disk-fill into an observable, self-healing event it logs and notifies about. `memguard` is the memory counterpart: it watches the kernel's pressure level and warns early (naming the offender), but **never** kills or deletes, because a memory spike has nothing safe to auto-reap.
 
 ## Options
 
@@ -89,7 +90,10 @@ Four principles, in order of trust:
 | `KEEP_DAYS` | `30` | Age gate for the deep tier. |
 | `KEEP_RECENT` | `5` | Always keep the N newest entries per category. |
 | `WARN_GB` | `20` | `diskguard` reclaims + notifies below this. |
-| `CRIT_GB` | `10` | `diskguard` posts an urgent notice below this. |
+| `CRIT_GB` | `10` | `diskguard` posts an urgent notice below this; `memguard` uses it as the disk floor for its coupling alert. |
+| `FREE_WARN_PCT` | `15` | `memguard` warns when free memory is at/below this %. |
+| `FREE_CRIT_PCT` | `5` | `memguard` posts an urgent (jetsam-imminent) notice at/below this %. |
+| `NOTIFY_COOLDOWN` | `1800` | `memguard` seconds between repeat same-level banners. |
 | `WORKTREE_BACKUP_DIR` | `~/.local/share/worktree-backups` | Where worktree bundles land. |
 | `WORKTREE_ROOTS` | unset | Constrain `worktree-audit` when no positional roots are passed. If set, defaults are not scanned; a nonexistent path yields no repos instead of falling back. |
 
@@ -141,14 +145,15 @@ macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. The s
 
 ## Automation & uninstall
 
-`make install` also installs two launchd agents:
+`make install` also installs three launchd agents:
 
 - `com.mac-optimize.diskguard` — at login + every 3 h
+- `com.mac-optimize.memguard` — at login + every 5 min
 - `com.mac-optimize.mac-reclaim` — weekly, Sundays 11:00 (daytime, so the laptop is awake)
 
 The plists are templates; `install.sh` fills in `$HOME` and a cross-arch `PATH` at install time, so nothing is hardcoded to one machine.
 
-**Notification permission (one-time):** the first low-disk banner may require allowing notifications for the invoking process (osascript / Script Editor) under **System Settings → Notifications**. No blocking dialogs are ever used, so a missed banner is cosmetic — the reclaim still runs and is logged to `~/Library/Logs/diskguard.log`.
+**Notification permission (one-time):** the first low-disk or low-memory banner may require allowing notifications for the invoking process (osascript / Script Editor) under **System Settings → Notifications**. No blocking dialogs are ever used, so a missed banner is cosmetic — the guard still runs and logs to `~/Library/Logs/diskguard.log` / `~/Library/Logs/memguard.log`.
 
 ```bash
 make uninstall      # unloads agents, removes deployed scripts; repo left intact

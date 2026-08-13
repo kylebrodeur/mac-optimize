@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# memguard — proactive memory-pressure watcher for an agent-heavy Mac.
+# Meant to be run by launchd on an interval (see com.mac-optimize.memguard.plist).
+#
+# The OTHER half of the earlyoom lesson. diskguard ported the WSL2 writeup's
+# disk story; this ports the ORIGINAL one — memory. On a 16 GB Mac running a
+# fleet of coding agents the silent-and-fatal failure is jetsam: once RAM +
+# compressor + swap are exhausted the kernel starts killing processes, and the
+# first victims are whatever apps happen to be suspended (a browser, your
+# editor). memguard turns that into an observable, early, NAMED event — and it
+# NEVER kills or deletes anything itself. It only measures, logs, and notifies.
+#
+# The signals that predict jetsam are the kernel's own MEMORY-PRESSURE LEVEL
+# (kern.memorystatus_vm_pressure_level: 1 normal / 2 warn / 4 critical — the
+# exact thing jetsam acts on, readable without sudo) and FREE MEMORY PERCENTAGE
+# (what Activity Monitor's pressure math uses, via `memory_pressure`). At the
+# real jetsam event on this class of machine, free pages were ~1%. Those two
+# drive state here; the pressure level is authoritative, free% is the
+# human-readable early-warning band.
+#
+# Swap is deliberately NOT a trigger. `vm.swapusage` "total" is not a fixed cap:
+# macOS allocates swapfiles on demand and swapped-out idle pages linger, so
+# used/total sits near 80-100% whenever swap was EVER touched — crisis or not.
+# Treating that as pressure would fire constantly (the alarm-fatigue trap).
+# Swap is shown as absolute used/total MB for context only.
+#
+# The one place disk matters: macOS swapfiles live on the Data volume, so swap
+# CANNOT grow when that volume is full. So "RAM already tight AND disk nearly
+# full" is the true jetsam-imminent quadrant — the state that took the machine
+# down — and it escalates a warn to an urgent alert. Note this requires real
+# RAM tightness; low disk alone is diskguard's job, not memguard's.
+#
+# Why a watcher and not a fix: the spike is usually transient (a coding agent
+# fanning out subagents, or a headed browser under test), so there is nothing
+# safe to auto-delete. Naming the largest RAM consumer early lets the human act
+# (close a pane, cap concurrency) before the kernel picks the victim for them.
+#
+# Env thresholds:
+#   FREE_WARN_PCT=15   free memory <= this %  -> warn + name top RAM user
+#   FREE_CRIT_PCT=5    free memory <= this %  -> urgent (jetsam-imminent)
+#   CRIT_GB=10         when RAM is in the warn band, free disk below this (GB)
+#                      escalates to the urgent coupling alert (swap can't grow).
+#                      Shares diskguard's CRIT_GB default.
+#   NOTIFY_COOLDOWN=1800  seconds to wait before repeating a same-level banner
+
+# launchd hands us a near-empty environment; bake in the standard dirs so the
+# tools we call (memory_pressure, vm_stat, sysctl, df, ps) resolve on both
+# Apple Silicon and Intel. Missing tools degrade gracefully.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+set -uo pipefail
+DATA_VOL="/System/Volumes/Data"
+FREE_WARN_PCT="${FREE_WARN_PCT:-15}"
+FREE_CRIT_PCT="${FREE_CRIT_PCT:-5}"
+CRIT_GB="${CRIT_GB:-10}"
+NOTIFY_COOLDOWN="${NOTIFY_COOLDOWN:-1800}"
+LOG="$HOME/Library/Logs/memguard.log"
+STATEF="$LOG.state"
+mkdir -p "$(dirname "$LOG")"
+
+logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
+notify()  {  # $1=title  $2=message ; non-blocking, never a modal dialog
+  [ -x /usr/bin/osascript ] || return 0
+  /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
+}
+
+# Free space (whole GB) on the Data volume.
+free_disk_gb() { df -k "$DATA_VOL" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}'; }
+
+# System-wide free-memory percentage — the kernel's own figure. Available
+# without sudo. Falls back to a conservative vm_stat estimate if the tool is
+# absent (leans toward reporting pressure, which is safe for a warner).
+free_mem_pct() {
+  local p
+  p=$(memory_pressure 2>/dev/null | awk '/free percentage/{for(i=1;i<=NF;i++) if($i ~ /%$/){gsub(/%/,"",$i); print $i; exit}}')
+  if [ -n "$p" ]; then printf '%d' "$p"; return; fi
+  vm_stat 2>/dev/null | awk '
+    /Pages free/        {gsub(/\./,"",$3); f=$3}
+    /Pages speculative/ {gsub(/\./,"",$3); s=$3}
+    /Pages purgeable/   {gsub(/\./,"",$3); pu=$3}
+    /Pages inactive/    {gsub(/\./,"",$3); iv=$3}
+    /Pages active/      {gsub(/\./,"",$3); a=$3}
+    /Pages wired/       {gsub(/\./,"",$4); w=$4}
+    /occupied by compressor/ {gsub(/\./,"",$5); c=$5}
+    END{ tot=f+s+pu+iv+a+w+c; if(tot>0) printf "%d",((f+s+pu+iv)/tot)*100; else print 100 }'
+}
+
+# Swap as an honest "used/total MB" string for context (NOT a trigger — see the
+# header note on why swap ratio is a bad pressure signal). "off" if swap is 0.
+swap_str() {
+  sysctl -n vm.swapusage 2>/dev/null | awk '
+    function mib(s){ n=s+0; if(s ~ /G/) return n*1024; if(s ~ /K/) return n/1024; return n }
+    { for(i=1;i<=NF;i++){ if($i=="total")t=mib($(i+2)); if($i=="used")u=mib($(i+2)) } }
+    END{ if(t>0) printf "%d/%dMB", u, t; else printf "off" }'
+}
+
+# Largest resident process, as "name (NNN MB)". `ps -m` sorts by memory (NOT
+# `-r`, which sorts by CPU); rss= comm= suppress the header so the first row is
+# the top consumer. comm can hold spaces, so keep everything after the rss.
+top_ram_user() {
+  ps -Axo rss=,comm= -m 2>/dev/null | awk 'NR==1{r=$1; $1=""; sub(/^ +/,""); n=$0; sub(/.*\//,"",n); printf "%s (%d MB)", n, r/1024}'
+}
+
+DISK=$(free_disk_gb);  DISK=${DISK:-999}
+FREE=$(free_mem_pct);  FREE=${FREE:-100}
+SWAP=$(swap_str);      SWAP=${SWAP:-off}
+TOP=$(top_ram_user);   TOP=${TOP:-unknown}
+# Kernel's own memory-pressure level — the exact signal jetsam acts on:
+# 1=normal, 2=warn, 4=critical. Readable without sudo; 0 if unavailable (then
+# free% carries the decision alone).
+PLEVEL=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null); PLEVEL=${PLEVEL:-0}
+case "$PLEVEL" in 4) PL="L4-critical";; 2) PL="L2-warn";; 1) PL="L1-normal";; *) PL="L?";; esac
+
+# Classify on the kernel pressure level and free RAM together. Critical = the
+# kernel is already at its critical level, OR free RAM at/below the crit floor,
+# OR the coupling quadrant (RAM tight AND disk too full for swap to grow).
+# Warn = the kernel is at warn level, or free RAM is in the warn band.
+mem_tight=0
+{ [ "$FREE" -le "$FREE_WARN_PCT" ] || [ "$PLEVEL" -ge 2 ]; } && mem_tight=1
+
+state=ok
+if [ "$FREE" -le "$FREE_CRIT_PCT" ] || [ "$PLEVEL" -ge 4 ] || { [ "$mem_tight" = 1 ] && [ "$DISK" -lt "$CRIT_GB" ]; }; then
+  state=crit
+elif [ "$mem_tight" = 1 ]; then
+  state=warn
+fi
+
+# The disk<->swap coupling note — only when disk is the aggravating factor AND
+# RAM is genuinely tight.
+disk_note=""
+{ [ "$mem_tight" = 1 ] && [ "$DISK" -lt "$CRIT_GB" ]; } && \
+  disk_note=" Disk only ${DISK}GB free, so swap can't grow — free disk to relieve this."
+
+summary="free ${FREE}% RAM (pressure ${PL}), swap ${SWAP}, disk ${DISK}GB — largest: ${TOP}"
+
+# Debounced notification: always log, but only banner on escalation or after the
+# cooldown, so a frequent poll under sustained pressure doesn't spam.
+rank(){ case "$1" in crit) echo 2;; warn) echo 1;; *) echo 0;; esac; }
+prev_state=ok; prev_notify=0
+[ -f "$STATEF" ] && read -r prev_state prev_notify < "$STATEF" 2>/dev/null
+prev_state=${prev_state:-ok}; prev_notify=${prev_notify:-0}
+now=$(date +%s)
+last_notify=$prev_notify
+
+do_notify=0
+if [ "$state" != ok ]; then
+  if [ "$(rank "$state")" -gt "$(rank "$prev_state")" ] || [ $(( now - prev_notify )) -ge "$NOTIFY_COOLDOWN" ]; then
+    do_notify=1
+  fi
+fi
+
+case "$state" in
+  ok)   logline "ok: $summary" ;;
+  warn) logline "WARN: $summary"
+        [ "$do_notify" = 1 ] && { notify "memguard: memory tight" "${summary}.${disk_note} Consider closing an agent/pane."; last_notify=$now; } ;;
+  crit) logline "CRITICAL: $summary"
+        [ "$do_notify" = 1 ] && { notify "memguard: memory CRITICAL — jetsam risk" "${summary}. Close an agent NOW.${disk_note}"; last_notify=$now; } ;;
+esac
+
+printf '%s %s\n' "$state" "$last_notify" >"$STATEF"
+
+# self-cap this log (the journald lesson)
+[ -f "$LOG" ] && { tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }
+exit 0
