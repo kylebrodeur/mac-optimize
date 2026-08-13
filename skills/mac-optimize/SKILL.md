@@ -1,6 +1,6 @@
 ---
 name: mac-optimize
-description: Diagnose and reclaim disk space and audit stray git worktrees on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", or "find/clean git worktrees"; or for routine maintenance. Drives the diskreport, mac-reclaim, and worktree-audit command-line tools with a safety-first workflow.
+description: Diagnose and reclaim disk space, audit stray git worktrees, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", or "find/clean git worktrees"; or for routine maintenance. Drives the diskreport, mac-reclaim, and worktree-audit command-line tools with a safety-first workflow.
 compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
 license: MIT
 metadata:
@@ -39,7 +39,21 @@ mac-reclaim --deep --dry-run     # shows every candidate + WHY it's considered u
 mac-reclaim --deep               # prompts before deleting
 ```
 
-The deep tier reports orphaned VS Code `workspaceStorage` as REVIEW/protected and never removes it until an archive-first backup and explicit verified prune workflow exists. It prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only when they're past `KEEP_DAYS`, beyond the newest `KEEP_RECENT`, not open per `lsof`, and not allowlisted. Never run `--deep` unattended or with `--yes` unless the user has reviewed a dry-run.
+The deep tier reports orphaned VS Code `workspaceStorage` as REVIEW/protected and never removes it — reclaim it archive-first, by hand (see below). It prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only when they're past `KEEP_DAYS`, beyond the newest `KEEP_RECENT`, not open per `lsof`, and not allowlisted. Never run `--deep` unattended or with `--yes` unless the user has reviewed a dry-run.
+
+### Reclaiming orphaned `workspaceStorage` (manual, archive-first)
+
+`mac-reclaim` keeps this REVIEW-only. The bulk of it is usually AI chat history from
+dead projects, so treat it as *work* — archive before deleting:
+
+1. Split **orphan** (project folder gone) from **alive** (folder still exists); leave alive alone.
+2. `tar --zstd` each orphan's `chatSessions/` + `chatEditingSessions/` + `workspace.json` into one
+   archive; write a manifest of hashes + original paths; verify every hash is listed in the archive.
+3. Delete the orphan dirs only after the archive verifies. Skip any whose folder is on an unmounted
+   `/Volumes/` path, and re-check the folder is really gone at delete time.
+
+(The shelved encrypted `rclone`-crypt version of this — `vscode-chat-backup` — is archived under
+`docs/superpowers/_archive/`; only its fingerprint/manifest primitives shipped.)
 
 ## 4. Audit and reclaim git worktrees
 
@@ -57,6 +71,15 @@ worktree-audit --backup --prune  # archive, then remove the ones that archived c
 ```
 
 Locked worktrees are always skipped. Backups land in `~/.local/share/worktree-backups/` with a `manifest.tsv` of restore commands.
+
+## Memory pressure (not just disk)
+
+These machines also die from **memory**: a fleet of agents exhausts RAM + swap and macOS's jetsam
+killer force-quits apps. That is watched by `memguard` (installed via the `mac-optimize-setup` skill),
+which warns — naming the largest process — before jetsam acts, and never kills anything itself. If the
+Mac "feels slow" or apps get force-quit, check `~/Library/Logs/memguard.log` and
+`sysctl kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical). Reclaiming disk helps
+here too: swap can't grow on a full volume, so a full disk turns memory pressure fatal faster.
 
 ## The rule
 

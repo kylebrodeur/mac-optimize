@@ -26,7 +26,7 @@ Allowlist: `~/.config/mac-reclaim/keep.txt` — one path substring per line; any
 
 Safe tier clears: `~/.npm/_cacache` + `_npx`, `pnpm store prune`, `uv cache prune`, `brew cleanup -s`, `bun pm cache rm`, `~/.cache/codex-runtimes`, `~/.cache/node`, `*.ShipIt` updaters, VS Code `CachedExtensionVSIXs`/`Cache`/`CachedData`/`Crashpad`, and stale app logs.
 
-Deep tier: orphaned VS Code `workspaceStorage` is reported as **REVIEW/protected** and is never removed until an archive-first backup and explicit verified prune workflow exists. The only deep-delete candidates (only when idle > `KEEP_DAYS`, beyond newest `KEEP_RECENT`, not open per `lsof`, not allowlisted) are `vm_bundles`, `local-agent-mode-sessions`, and `~/.claude/projects`.
+Deep tier: orphaned VS Code `workspaceStorage` is reported as **REVIEW/protected** and is never auto-removed; reclaim it manually, archive-first (tar `chatSessions/` + `chatEditingSessions/` + `workspace.json`, verify, then delete — skipping unmounted `/Volumes/` paths, re-checking the folder is gone). Only Task-1 primitives shipped in `bin/vscode-chat-backup`; the full encrypted workflow is archived under `docs/superpowers/_archive/`. The only deep-delete candidates (only when idle > `KEEP_DAYS`, beyond newest `KEEP_RECENT`, not open per `lsof`, not allowlisted) are `vm_bundles`, `local-agent-mode-sessions`, and `~/.claude/projects`.
 
 Log: `~/Library/Logs/mac-reclaim.log`, self-capped to the last 500 lines.
 
@@ -57,3 +57,9 @@ tar -xzf <stem>.untracked.tar.gz -C <worktree>
 ```
 
 For a detached backup, fetch the recorded sha instead of a branch name. The `manifest.tsv` row has the exact command.
+
+## memguard (memory watcher)
+
+Automation, not an interactive CLI (installed by the `mac-optimize-setup` skill; runs via launchd at login + every 5 min). Reads `kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical) and the free-RAM % from `memory_pressure`, names the largest RAM process, and notifies — it **never** kills or deletes. Swap is shown as `used/totalMB` for context only (the ratio is not a trigger: it sits ~80% whenever swap was ever touched). Escalates to the coupling alert when RAM is tight **and** disk is below `CRIT_GB` (swap can't grow on a full volume).
+
+Env: `FREE_WARN_PCT` (15), `FREE_CRIT_PCT` (5), `CRIT_GB` (10), `NOTIFY_COOLDOWN` (1800s). Log: `~/Library/Logs/memguard.log`, self-capped to 500 lines.

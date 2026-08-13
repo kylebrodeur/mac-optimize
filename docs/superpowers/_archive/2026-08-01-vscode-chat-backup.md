@@ -1,3 +1,10 @@
+> **ARCHIVED 2026-08-13 — shelved after Task 1.** Only the manifest/fingerprint
+> primitives (Task 1) shipped in `bin/vscode-chat-backup`; the rclone-crypt
+> upload/verify/restore/prune workflow (Tasks 2–7) was never built. Orphaned VS
+> Code `workspaceStorage` is instead reclaimed manually, archive-first (tar each
+> orphan's `chatSessions/` + `chatEditingSessions/` + `workspace.json`, verify,
+> then delete). Kept for reference if the full workflow is ever revisited.
+
 # VS Code Chat Backup Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -36,7 +43,7 @@
 - **Modify:** `README.md` — document the separate plan/upload/verify/restore/prune-verified workflow and recovery warning.
 - **Modify:** `TESTING.md` — add the encrypted round-trip, crash reconciliation, hostile tar, and no-overwrite restore gates.
 - **Modify:** `skills/mac-optimize/SKILL.md` and `skills/mac-optimize/references/reference.md` — point REVIEW workspaceStorage users to the new archive-first workflow.
-- **Reference:** `docs/superpowers/specs/2026-08-01-vscode-chat-backup-design.md` — approved behavior contract; implementation must not weaken it.
+- **Reference:** `docs/superpowers/_archive/2026-08-01-vscode-chat-backup-design.md` — approved behavior contract; implementation must not weaken it.
 
 ---
 

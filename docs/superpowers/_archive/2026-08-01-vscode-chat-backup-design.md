@@ -1,10 +1,16 @@
+> **ARCHIVED 2026-08-13.** Design contract for a full encrypted `vscode-chat-backup`
+> workflow. Only Task 1 (manifest + deterministic tree-fingerprint primitives) was
+> implemented in `bin/vscode-chat-backup`; the rclone-crypt upload/verify/restore/
+> prune workflow described below was never built. Retained as the reference
+> contract if it is ever revisited.
+
 # VS Code Chat Backup Design
 
 ## Date
 2026-08-01
 
 ## Status
-Approved for implementation.
+Archived 2026-08-13 — shelved after Task 1 (primitives only); full workflow never built.
 
 ## Problem and Evidence
 

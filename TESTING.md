@@ -199,11 +199,13 @@ Re-running immediately should reclaim ≈0 (idempotent).
 `~/Library/Application Support/Code/User/workspaceStorage` directories are
 classified as REVIEW and are never deletion candidates for `mac-reclaim`.
 Current live evidence found chat-bearing state in these directories, so cleanup
-must be archive-first. Any future pruning workflow for workspaceStorage is gated
-on the backup design spec at
-`docs/superpowers/specs/2026-08-01-vscode-chat-backup-design.md`; implementation
-must pass restore rehearsal, deterministic tree fingerprint, and hostile-archive
-extraction gates before any prune workflow is allowed.
+must be archive-first. Only the manifest/fingerprint primitives shipped in
+`bin/vscode-chat-backup`; the full encrypted prune workflow was shelved (archived
+design contract: `docs/superpowers/_archive/2026-08-01-vscode-chat-backup-design.md`).
+Until it exists, reclaim orphaned workspaceStorage by hand, archive-first: tar each
+orphan's `chatSessions/` + `chatEditingSessions/` + `workspace.json`, verify the
+archive lists every entry, then delete the orphans — skipping any whose project
+folder is on an unmounted `/Volumes/` path, and re-checking the folder is really gone.
 
 First verify the `agent-session-kill` delegation logic with a disposable home so
 the check does not scan live agent state:
