@@ -41,7 +41,24 @@
 #   CRIT_GB=10         when RAM is in the warn band, free disk below this (GB)
 #                      escalates to the urgent coupling alert (swap can't grow).
 #                      Shares diskguard's CRIT_GB default.
-#   NOTIFY_COOLDOWN=1800  seconds to wait before repeating a same-level banner
+#   NOTIFY_COOLDOWN=1800         seconds before repeating a same-level banner
+#   COUPLING_NOTIFY_COOLDOWN=300 shorter repeat cooldown used ONLY while the
+#                                disk<->swap coupling note is active — this is
+#                                the specific quadrant that force-panicked this
+#                                machine once already (watchdog timeout: disk
+#                                hit 0GB while swap sat near its ceiling), so it
+#                                nags roughly every run instead of every 30 min.
+#   RECLAIM_COOLDOWN=900         minimum seconds between memguard-triggered
+#                                reclaims (below). Still only ever the SAFE
+#                                tier — same as diskguard, never --deep, never
+#                                kills a process. This just runs it a cycle or
+#                                two sooner than diskguard's own schedule would,
+#                                specifically when disk is the aggravating
+#                                factor in real memory pressure, because that
+#                                coupling is what turned a routine, transient
+#                                warn into a sustained one long enough to starve
+#                                watchdogd. Set to 0 to disable auto-reclaim
+#                                entirely and fall back to notify-only.
 
 # launchd hands us a near-empty environment; bake in the standard dirs so the
 # tools we call (memory_pressure, vm_stat, sysctl, df, ps) resolve on both
@@ -54,6 +71,8 @@ FREE_WARN_PCT="${FREE_WARN_PCT:-15}"
 FREE_CRIT_PCT="${FREE_CRIT_PCT:-5}"
 CRIT_GB="${CRIT_GB:-10}"
 NOTIFY_COOLDOWN="${NOTIFY_COOLDOWN:-1800}"
+COUPLING_NOTIFY_COOLDOWN="${COUPLING_NOTIFY_COOLDOWN:-300}"
+RECLAIM_COOLDOWN="${RECLAIM_COOLDOWN:-900}"
 LOG="$HOME/Library/Logs/memguard.log"
 STATEF="$LOG.state"
 mkdir -p "$(dirname "$LOG")"
@@ -134,17 +153,22 @@ disk_note=""
 summary="free ${FREE}% RAM (pressure ${PL}), swap ${SWAP}, disk ${DISK}GB — largest: ${TOP}"
 
 # Debounced notification: always log, but only banner on escalation or after the
-# cooldown, so a frequent poll under sustained pressure doesn't spam.
+# cooldown, so a frequent poll under sustained pressure doesn't spam. The
+# coupling case gets its own (shorter) cooldown — see header note on why.
 rank(){ case "$1" in crit) echo 2;; warn) echo 1;; *) echo 0;; esac; }
-prev_state=ok; prev_notify=0
-[ -f "$STATEF" ] && read -r prev_state prev_notify < "$STATEF" 2>/dev/null
-prev_state=${prev_state:-ok}; prev_notify=${prev_notify:-0}
+prev_state=ok; prev_notify=0; prev_reclaim=0
+[ -f "$STATEF" ] && read -r prev_state prev_notify prev_reclaim < "$STATEF" 2>/dev/null
+prev_state=${prev_state:-ok}; prev_notify=${prev_notify:-0}; prev_reclaim=${prev_reclaim:-0}
 now=$(date +%s)
 last_notify=$prev_notify
+last_reclaim=$prev_reclaim
+
+cooldown="$NOTIFY_COOLDOWN"
+[ -n "$disk_note" ] && cooldown="$COUPLING_NOTIFY_COOLDOWN"
 
 do_notify=0
 if [ "$state" != ok ]; then
-  if [ "$(rank "$state")" -gt "$(rank "$prev_state")" ] || [ $(( now - prev_notify )) -ge "$NOTIFY_COOLDOWN" ]; then
+  if [ "$(rank "$state")" -gt "$(rank "$prev_state")" ] || [ $(( now - prev_notify )) -ge "$cooldown" ]; then
     do_notify=1
   fi
 fi
@@ -157,7 +181,26 @@ case "$state" in
         [ "$do_notify" = 1 ] && { notify "memguard: memory CRITICAL — jetsam risk" "${summary}. Close an agent NOW.${disk_note}"; last_notify=$now; } ;;
 esac
 
-printf '%s %s\n' "$state" "$last_notify" >"$STATEF"
+# Auto-relieve the coupling quadrant: SAFE tier only (same as diskguard —
+# rebuildable caches, never a process, never --deep). This is the one lever
+# that's already proven safe elsewhere in this repo, run a cycle or two sooner
+# than diskguard's own schedule specifically because disk is what's blocking
+# swap from growing right now. Own cooldown so a sustained crisis doesn't
+# re-run it every 5 minutes if it isn't helping.
+if [ -n "$disk_note" ] && [ "${RECLAIM_COOLDOWN:-900}" -gt 0 ] && [ $(( now - prev_reclaim )) -ge "$RECLAIM_COOLDOWN" ]; then
+  reclaim_bin=""
+  if command -v mac-reclaim >/dev/null 2>&1; then reclaim_bin="mac-reclaim"
+  elif [ -x "$HOME/.local/bin/mac-reclaim" ]; then reclaim_bin="$HOME/.local/bin/mac-reclaim"; fi
+  if [ -n "$reclaim_bin" ]; then
+    logline "coupling: disk ${DISK}GB free, RAM tight -> safe reclaim"
+    "$reclaim_bin" --quiet >>"$LOG" 2>&1
+    AFTER_DISK=$(free_disk_gb); AFTER_DISK=${AFTER_DISK:-$DISK}
+    logline "coupling reclaim done: ${DISK}GB -> ${AFTER_DISK}GB"
+    last_reclaim=$now
+  fi
+fi
+
+printf '%s %s %s\n' "$state" "$last_notify" "$last_reclaim" >"$STATEF"
 
 # self-cap this log (the journald lesson)
 [ -f "$LOG" ] && { tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }

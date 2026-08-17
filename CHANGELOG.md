@@ -21,6 +21,18 @@ All notable changes to **mac-optimize** are documented here. The format follows
   **not** built and has been archived (see `docs/superpowers/_archive/`).
 
 ### Changed
+- **`memguard`** now auto-triggers `mac-reclaim`'s SAFE tier immediately (own
+  `RECLAIM_COOLDOWN`, default 900s) the moment it detects the disk↔swap coupling
+  quadrant, instead of only notifying and waiting for `diskguard`'s own schedule.
+  Repeat banners in that specific quadrant now use a tighter
+  `COUPLING_NOTIFY_COOLDOWN` (default 300s) instead of the normal 1800s. Prompted
+  by a real incident: sustained RAM pressure + disk hitting 0GB (swap at 97% of
+  an 18GB ceiling) starved `watchdogd` long enough to force a kernel panic —
+  `memguard` had correctly logged `CRITICAL` every cycle for hours but never
+  acted, because acting was previously out of scope for a "never kills or
+  deletes" watcher. The safe cache tier is not app state or a process, so
+  running it sooner doesn't cross that line; only the timing changed. Set
+  `RECLAIM_COOLDOWN=0` to restore the prior notify-only behavior.
 - **`diskguard`** now escalates when the safe tier can't restore headroom: it
   names the biggest disk consumers, flags the safe tier as exhausted, points at
   the deep tools, and debounces repeat banners (via a `.state` file) instead of

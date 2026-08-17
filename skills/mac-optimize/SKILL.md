@@ -88,10 +88,14 @@ Locked worktrees are always skipped. Backups land in `~/.local/share/worktree-ba
 
 These machines also die from **memory**: a fleet of agents exhausts RAM + swap and macOS's jetsam
 killer force-quits apps. That is watched by `memguard` (installed via the `mac-optimize-setup` skill),
-which warns — naming the largest process — before jetsam acts, and never kills anything itself. If the
-Mac "feels slow" or apps get force-quit, check `~/Library/Logs/memguard.log` and
-`sysctl kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical). Reclaiming disk helps
-here too: swap can't grow on a full volume, so a full disk turns memory pressure fatal faster.
+which warns — naming the largest process — before jetsam acts, and never kills a process or deletes
+app state itself. If the Mac "feels slow" or apps get force-quit, check `~/Library/Logs/memguard.log`
+and `sysctl kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical). Reclaiming disk helps
+here too: swap can't grow on a full volume, so a full disk turns memory pressure fatal faster — this
+combination (RAM tight *and* disk too low for swap to grow) has actually force-panicked a machine via a
+`watchdogd` timeout, so `memguard` now auto-triggers `mac-reclaim`'s SAFE tier the moment it detects that
+exact quadrant, instead of waiting for `diskguard`'s own schedule — still cache-only, still no process
+ever killed.
 
 ## The rule
 
