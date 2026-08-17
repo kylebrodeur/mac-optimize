@@ -2,9 +2,31 @@
 # diskreport — "where is my disk going?" for an agent-heavy dev Mac.
 # Read-only. Surfaces the top consumers plus the specific dirs that balloon
 # during agent runs, so the answer is never "I don't know what's using it."
+#
+# Usage:
+#   diskreport               fast fixed-bucket report (default, always run)
+#   diskreport --scan [PATH] + a one-shot 'dust' scan of PATH (default: $HOME)
+#                             to surface big single files/dirs the fixed
+#                             buckets above don't look inside (e.g. a stray
+#                             .zip buried in an app's Application Support).
+#                             Requires 'dust' (brew install dust). Slower —
+#                             walks the whole tree — so it's opt-in, not part
+#                             of the default fast path.
+#
+# For open-ended interactive digging (not a report), use ncdu directly:
+#   ncdu ~                    or any path — navigate, sort, delete in place.
 
 set -uo pipefail
 AS="$HOME/Library/Application Support"
+SCAN=0; SCAN_PATH="$HOME"
+for a in "${@:-}"; do
+  case "$a" in
+    --scan) SCAN=1 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    "") : ;;
+    *) SCAN_PATH="$a" ;;
+  esac
+done
 
 hr() { printf '%s\n' "──────────────────────────────────────────────"; }
 section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -35,3 +57,13 @@ done
 section "Recent reclaims"
 tail -n 5 "$HOME/Library/Logs/mac-reclaim.log" 2>/dev/null || echo "  (none yet — run 'mac-reclaim')"
 hr
+
+if [ "$SCAN" = 1 ]; then
+  section "Deep scan — biggest items under ${SCAN_PATH/#$HOME/~} (dust)"
+  if command -v dust >/dev/null 2>&1; then
+    dust -n 20 -d 3 "$SCAN_PATH" 2>&1
+  else
+    echo "  'dust' not found — brew install dust (or: ncdu \"$SCAN_PATH\")"
+  fi
+  hr
+fi

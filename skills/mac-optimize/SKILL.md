@@ -22,6 +22,18 @@ diskreport
 
 Shows the volume's free space, top consumers in `~/Library/Application Support` and `~/Library/Caches`, the dev/agent caches that regrow, and a REVIEW tier of large-but-real state (VS Code `workspaceStorage`, Claude `vm_bundles`). It also flags APFS local snapshots — the classic "invisible" disk sink. Never destructive.
 
+If the fixed buckets above don't explain the free-space gap (e.g. a big single file buried inside
+some app's `Application Support`), go wider:
+
+```
+diskreport --scan [PATH]     # one-shot 'dust' walk of PATH (default $HOME); opt-in, walks the whole tree
+ncdu [PATH]                  # interactive instead — navigate, sort, delete in place
+```
+
+Both require Homebrew (`brew install ncdu dust`); `diskreport --scan` prints a hint instead of failing
+if `dust` isn't installed. Still read-only/manual — `ncdu`'s delete key is a human action, not something
+to script unattended.
+
 ## 2. Reclaim safe caches
 
 ```

@@ -52,7 +52,7 @@ worktree-audit        # find stray git worktrees
 
 | Tool | What it does |
 |------|--------------|
-| **`diskreport`** | Read-only "where did my disk go?" — top consumers in `Application Support`, `Caches`, and dev/agent caches, plus the big "review-tier" state (VS Code `workspaceStorage`, Claude `vm_bundles`, `.claude/projects`) and recent reclaim history. Deletes nothing. |
+| **`diskreport`** | Read-only "where did my disk go?" — top consumers in `Application Support`, `Caches`, and dev/agent caches, plus the big "review-tier" state (VS Code `workspaceStorage`, Claude `vm_bundles`, `.claude/projects`) and recent reclaim history. Deletes nothing. `--scan [PATH]` adds a one-shot [`dust`](https://github.com/bootandy/dust) walk of PATH (default `$HOME`) to catch big single files/dirs the fixed buckets don't look inside — opt-in since it walks the whole tree. For open-ended interactive digging, use [`ncdu`](https://dev.yorhel.nl/ncdu) directly (`brew install ncdu dust`) — navigate, sort, delete in place. |
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only with *evidence* they're unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and never removed until an archive-first backup and explicit verified prune workflow exists. |
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
@@ -75,6 +75,7 @@ Four principles, in order of trust:
 | Command | Effect |
 |---------|--------|
 | `diskreport` | Read-only disk report. |
+| `diskreport --scan [PATH]` | + one-shot `dust` walk of PATH (default `$HOME`) for big single files/dirs the fixed buckets miss. Requires `dust`. |
 | `mac-reclaim` | Reclaim safe caches (unattended-safe). |
 | `mac-reclaim --deep --dry-run` | Preview deep prune — deletes nothing, prints each candidate + why it's unused. |
 | `mac-reclaim --deep` | Deep prune (prompts). Add `--yes` to skip the prompt (automation). |
@@ -141,7 +142,7 @@ These solve adjacent problems well; this repo defers to them rather than shippin
 
 ## Requirements
 
-macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. The safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each tool is guarded by `command -v`).
+macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. The safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each tool is guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
 
 ## Automation & uninstall
 
