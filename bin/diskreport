@@ -45,6 +45,11 @@ du -h -d1 "$HOME/Library/Caches" 2>/dev/null | sort -rh | grep -v "Caches\$" | h
 section "Dev / agent caches (these regrow — 'mac-reclaim' clears them)"
 du -sh "$HOME/.npm" "$HOME/Library/pnpm" "$HOME/.cache" "$HOME/.bun" 2>/dev/null | sort -rh
 
+# Enumerated, not hardcoded: the 2026-08 audit found ~30GB in dot-dirs
+# (.codex/.gemini/.omp/.vscode) that a fixed list had never looked at.
+section "Top hidden dot-dirs — ~/.*  (agent CLIs hoard session logs here)"
+du -sh "$HOME"/.[!.]*/ 2>/dev/null | sort -rh | head -8
+
 section "REVIEW tier — big, but real state (prune via 'mac-reclaim --deep')"
 for p in \
   "$AS/Code/User/workspaceStorage" \
@@ -61,7 +66,10 @@ hr
 if [ "$SCAN" = 1 ]; then
   section "Deep scan — biggest items under ${SCAN_PATH/#$HOME/~} (dust)"
   if command -v dust >/dev/null 2>&1; then
-    dust -n 20 -d 3 "$SCAN_PATH" 2>&1
+    # -P when piped: dust's progress spinner writes \r frames to stderr, and
+    # merging them into a captured report buries the actual size tree.
+    if [ -t 1 ]; then dust -n 20 -d 3 "$SCAN_PATH" 2>&1
+    else dust -P -n 20 -d 3 "$SCAN_PATH" 2>/dev/null; fi
   else
     echo "  'dust' not found — brew install dust (or: ncdu \"$SCAN_PATH\")"
   fi
