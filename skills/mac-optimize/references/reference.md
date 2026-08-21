@@ -62,4 +62,4 @@ For a detached backup, fetch the recorded sha instead of a branch name. The `man
 
 Automation, not an interactive CLI (installed by the `mac-optimize-setup` skill; runs via launchd at login + every 5 min). Reads `kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4 critical) and the free-RAM % from `memory_pressure`, names the largest RAM process, and notifies — it **never** kills or deletes. Swap is shown as `used/totalMB` for context only (the ratio is not a trigger: it sits ~80% whenever swap was ever touched). Escalates to the coupling alert when RAM is tight **and** disk is below `CRIT_GB` (swap can't grow on a full volume).
 
-Env: `FREE_WARN_PCT` (15), `FREE_CRIT_PCT` (5), `CRIT_GB` (10), `NOTIFY_COOLDOWN` (1800s). Log: `~/Library/Logs/memguard.log`, self-capped to 500 lines.
+Env: `FREE_WARN_PCT` (15), `FREE_CRIT_PCT` (5), `CRIT_GB` (15), `NOTIFY_COOLDOWN` (1800s). Log: `~/Library/Logs/memguard.log`, self-capped to 500 lines.

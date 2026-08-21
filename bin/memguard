@@ -38,7 +38,7 @@
 # Env thresholds:
 #   FREE_WARN_PCT=15   free memory <= this %  -> warn + name top RAM user
 #   FREE_CRIT_PCT=5    free memory <= this %  -> urgent (jetsam-imminent)
-#   CRIT_GB=10         when RAM is in the warn band, free disk below this (GB)
+#   CRIT_GB=15         when RAM is in the warn band, free disk below this (GB)
 #                      escalates to the urgent coupling alert (swap can't grow).
 #                      Shares diskguard's CRIT_GB default.
 #   NOTIFY_COOLDOWN=1800         seconds before repeating a same-level banner
@@ -69,7 +69,7 @@ set -uo pipefail
 DATA_VOL="/System/Volumes/Data"
 FREE_WARN_PCT="${FREE_WARN_PCT:-15}"
 FREE_CRIT_PCT="${FREE_CRIT_PCT:-5}"
-CRIT_GB="${CRIT_GB:-10}"
+CRIT_GB="${CRIT_GB:-15}"
 NOTIFY_COOLDOWN="${NOTIFY_COOLDOWN:-1800}"
 COUPLING_NOTIFY_COOLDOWN="${COUPLING_NOTIFY_COOLDOWN:-300}"
 RECLAIM_COOLDOWN="${RECLAIM_COOLDOWN:-900}"

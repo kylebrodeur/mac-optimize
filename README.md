@@ -91,7 +91,7 @@ Four principles, in order of trust:
 | `KEEP_DAYS` | `30` | Age gate for the deep tier. |
 | `KEEP_RECENT` | `5` | Always keep the N newest entries per category. |
 | `WARN_GB` | `20` | `diskguard` reclaims + notifies below this. |
-| `CRIT_GB` | `10` | `diskguard` posts an urgent notice below this; `memguard` uses it as the disk floor for its coupling alert. |
+| `CRIT_GB` | `15` | `diskguard` posts an urgent notice below this; `memguard` uses it as the disk floor for its coupling alert. |
 | `FREE_WARN_PCT` | `15` | `memguard` warns when free memory is at/below this %. |
 | `FREE_CRIT_PCT` | `5` | `memguard` posts an urgent (jetsam-imminent) notice at/below this %. |
 | `NOTIFY_COOLDOWN` | `1800` | `memguard` seconds between repeat same-level banners. |

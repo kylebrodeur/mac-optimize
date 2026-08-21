@@ -9,7 +9,7 @@
 #
 # Env thresholds (GB of free space on the Data volume):
 #   WARN_GB=20   below this -> run safe reclaim + notify
-#   CRIT_GB=10   still below this after reclaim -> urgent notify, no auto-delete
+#   CRIT_GB=15   still below this after reclaim -> urgent notify, no auto-delete
 #   When the safe tier can't restore headroom, diskguard NAMES the biggest disk
 #   consumers, flags the safe tier as exhausted, points at the deep tools, and
 #   debounces repeat banners (escalation or NOTIFY_COOLDOWN) so a chronically
@@ -23,7 +23,7 @@ export PATH="$HOME/.local/bin:$HOME/Library/pnpm:/opt/homebrew/bin:/opt/homebrew
 set -uo pipefail
 DATA_VOL="/System/Volumes/Data"
 WARN_GB="${WARN_GB:-20}"
-CRIT_GB="${CRIT_GB:-10}"
+CRIT_GB="${CRIT_GB:-15}"
 LOG="$HOME/Library/Logs/diskguard.log"
 mkdir -p "$(dirname "$LOG")"
 AS="$HOME/Library/Application Support"
