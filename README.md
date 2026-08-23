@@ -137,15 +137,16 @@ These solve adjacent problems well; this repo defers to them rather than shippin
 
 ## Requirements
 
-macOS (Apple Silicon or Intel). Pure **bash** — no runtime dependencies. The safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each tool is guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
+macOS (Apple Silicon or Intel). The suite is **bash-first with zero runtime dependencies**; the safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Two tools — `codex-backup` and `vscode-chat-backup` — are **Python 3** (standard library only, already on macOS). `codex-backup` uses `rsync` and prefers Homebrew's `rsync` 3.x when present, falling back to the system `openrsync`. Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
 
 ## Automation & uninstall
 
-`make install` also installs three launchd agents:
+`make install` also installs four launchd agents:
 
 - `com.mac-optimize.diskguard` — at login + every 3 h
 - `com.mac-optimize.memguard` — at login + every 5 min
 - `com.mac-optimize.mac-reclaim` — weekly, Sundays 11:00 (daytime, so the laptop is awake)
+- `com.mac-optimize.codex-backup` — weekly, Sundays 11:30 (`codex-backup backup --quiet`; no-ops when the external drive isn't mounted, never deletes)
 
 The plists are templates; `install.sh` fills in `$HOME` and a cross-arch `PATH` at install time, so nothing is hardcoded to one machine.
 
