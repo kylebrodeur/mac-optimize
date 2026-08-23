@@ -19,6 +19,19 @@ All notable changes to **mac-optimize** are documented here. The format follows
   pointer/sidecar manifest validation and reconciliation). Foundation only; the
   full encrypted archive/verify/restore/prune workflow from the design spec was
   **not** built and has been archived (see `docs/superpowers/_archive/`).
+- **`codex-backup`** — back up, index, prune, and restore `~/.codex/sessions`,
+  the large single-copy JSONL rollout logs Codex writes per run (10 GB+ is
+  normal and was the dominant driver of one machine's disk drop). `backup`
+  rsyncs them to an external drive **cumulatively** (never `--delete`); `index`
+  buckets every session by idle age (45+/30-45/15-30/<15 days), size, project
+  (`cwd`), and backup status, writing a JSON+TSV index to both the drive and
+  `~/.codex/`; `prune --older-than N` deletes local sessions idle ≥ N days
+  **only when byte-verifiable in the backup** (dry-run default, keeps the N
+  newest, never touches un-backed-up files); `restore` round-trips by
+  date/uuid/project/all without clobbering newer local files; `verify` reports
+  drift. Ships a weekly launchd agent that runs `backup --quiet` and no-ops when
+  the drive is unmounted. Python 3 stdlib, prefers Homebrew rsync 3.x when
+  present. Covered by `test/codex-backup-test.sh` (23 assertions).
 
 ### Changed
 - **`memguard`** now auto-triggers `mac-reclaim`'s SAFE tier immediately (own

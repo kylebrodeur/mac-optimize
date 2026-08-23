@@ -1,7 +1,7 @@
 ---
 name: mac-optimize
-description: Diagnose and reclaim disk space, audit stray git worktrees, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", or "find/clean git worktrees"; or for routine maintenance. Drives the diskreport, mac-reclaim, and worktree-audit command-line tools with a safety-first workflow.
-compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
+description: Diagnose and reclaim disk space, audit stray git worktrees, back up and prune Codex agent sessions, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", "find/clean git worktrees", "back up my codex sessions", or "prune old codex/agent sessions"; or for routine maintenance. Drives the diskreport, mac-reclaim, worktree-audit, and codex-backup command-line tools with a safety-first workflow.
+compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit, codex-backup). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
 license: MIT
 metadata:
   author: kylebrodeur
@@ -83,6 +83,44 @@ worktree-audit --backup --prune  # archive, then remove the ones that archived c
 ```
 
 Locked worktrees are always skipped. Backups land in `~/.local/share/worktree-backups/` with a `manifest.tsv` of restore commands.
+
+## 5. Back up and prune Codex sessions
+
+`~/.codex/sessions` holds the JSONL "rollout" log of every Codex run. They are
+single-copy history (nothing regenerates them) and pile up fast — 10 GB+ is
+normal and is often the biggest hidden driver of a shrinking disk. `codex-backup`
+separates *keeping the history* from *keeping it on the internal SSD*.
+
+Back up first (cumulative — never deletes from the drive):
+
+```
+codex-backup backup            # rsync ~/.codex/sessions → external drive
+codex-backup index             # age buckets (45+/30-45/15-30/<15d) + backup status
+```
+
+Then, and only then, reclaim local space. Prune is dry-run by default and will
+**only** delete sessions it can verify are already in the backup:
+
+```
+codex-backup prune --older-than 30            # dry-run: what would go, grouped by project
+codex-backup prune --older-than 30 --apply    # delete local (backup keeps every copy)
+```
+
+It keeps the N newest (`--keep-recent`, default 5) and never deletes anything
+not backed up. Restore is a first-class inverse — by date, session uuid, project
+path, or all — and never clobbers a newer local file:
+
+```
+codex-backup restore --date 2026-07-20        # bring back one day
+codex-backup restore --cwd /path/to/project   # everything from one project
+codex-backup verify                           # local vs backup drift
+```
+
+The drive is resolved from `--dest`, `$CODEX_BACKUP_DEST`, `~/.config/mac-optimize/codex-backup.conf`,
+or the first mounted volume with a `mac-optimize-backups/` folder. A weekly launchd agent runs
+`backup --quiet` and silently no-ops whenever the drive isn't mounted — so pruning is always safe to
+run later against a current backup.
+
 
 ## Memory pressure (not just disk)
 

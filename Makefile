@@ -1,4 +1,4 @@
-.PHONY: install uninstall install-skills doctor report audit reclaim lint vendor-lib
+.PHONY: install uninstall install-skills doctor report audit reclaim backup sessions test lint vendor-lib
 
 install:
 	./install.sh
@@ -30,9 +30,25 @@ audit:
 reclaim:
 	bin/mac-reclaim
 
+# Cumulative backup of ~/.codex/sessions to the external drive (needs it mounted).
+backup:
+	bin/codex-backup backup
+
+# Age-bucketed inventory of Codex sessions + their backup status.
+sessions:
+	bin/codex-backup index
+
+# Run the self-contained regression harnesses.
+test:
+	@fail=0; for t in test/*.sh; do \
+		echo "── $$t"; bash "$$t" || fail=1; \
+	done; exit $$fail
+
 lint:
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck bin/* install.sh uninstall.sh; \
+		for f in bin/* install.sh uninstall.sh test/*.sh; do \
+			head -1 "$$f" | grep -q 'bash\|/sh' && shellcheck "$$f" || true; \
+		done; \
 	else \
 		echo "shellcheck not installed — skipping (brew install shellcheck)"; \
 	fi

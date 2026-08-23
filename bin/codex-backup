@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""codex-backup — back up, index, prune, and restore ~/.codex/sessions.
+
+Codex writes every run to a large JSONL "rollout" log under
+    ~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl
+These are the single-copy history of your Codex sessions. Nothing regenerates
+them, and they pile up fast (10 GB+ is normal), so this tool separates
+*keeping the history* from *keeping it on the internal SSD*:
+
+  backup    rsync sessions to an external drive. Cumulative: never --delete,
+            so a later local prune can free space while the backup keeps
+            everything.
+  index     inventory every session with age buckets (>45 / 30-45 / 15-30 /
+            <15 days idle), sizes, project (cwd), and backup status.
+  prune     delete LOCAL sessions idle longer than N days — but only ones
+            verified present in the backup. Dry-run by default.
+  restore   copy sessions back from the backup, by date / uuid / project /
+            all. Never clobbers a newer local file without --force.
+  verify    compare local vs backup and report drift (missing, size
+            mismatch, backup-only).
+
+The backup location is resolved from --dest, then $CODEX_BACKUP_DEST, then
+~/.config/mac-optimize/codex-backup.conf, then the first mounted volume under
+/Volumes that already contains a `mac-optimize-backups` directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SRC = Path.home() / ".codex" / "sessions"
+LOCAL_INDEX = Path.home() / ".codex" / "codex-backup-index.json"
+CONFIG = Path.home() / ".config" / "mac-optimize" / "codex-backup.conf"
+
+# ── colour (only on a tty) ────────────────────────────────────────────────────
+_TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+def bold(s): return _c("1", s)
+def dim(s): return _c("2", s)
+def green(s): return _c("32", s)
+def yellow(s): return _c("33", s)
+def red(s): return _c("31", s)
+
+
+def human(n: int) -> str:
+    """Bytes → human-readable, matching `du -h` rounding closely enough."""
+    step = 1024.0
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < step or unit == "T":
+            return (f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}")
+        n /= step
+    return f"{n:.1f}T"
+
+
+def now_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+# ── backup-root resolution ─────────────────────────────────────────────────────
+def find_backup_root(explicit: str | None) -> Path | None:
+    """Return the `mac-optimize-backups` directory, or None if unresolved."""
+    if explicit:
+        return Path(explicit).expanduser()
+    env = os.environ.get("CODEX_BACKUP_DEST")
+    if env:
+        return Path(env).expanduser()
+    if CONFIG.is_file():
+        for line in CONFIG.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("CODEX_BACKUP_DEST="):
+                return Path(line.split("=", 1)[1].strip().strip('"').strip("'")).expanduser()
+    vols = Path("/Volumes")
+    if vols.is_dir():
+        for v in sorted(vols.iterdir()):
+            cand = v / "mac-optimize-backups"
+            if cand.is_dir():
+                return cand
+    return None
+
+
+def sessions_dest(backup_root: Path) -> Path:
+    return backup_root / "codex-sessions"
+
+
+def root_available(root: Path | None) -> bool:
+    """True if we can actually write to the backup root — i.e. it exists, or its
+    parent volume is mounted so we can create the mac-optimize-backups dir."""
+    if root is None:
+        return False
+    return root.exists() or root.parent.is_dir()
+
+
+def require_backup_root(args) -> Path:
+    root = find_backup_root(getattr(args, "dest", None))
+    if not root_available(root):
+        sys.exit(red("No backup drive available. Mount the external drive (it needs "
+                     "a `mac-optimize-backups` folder), pass --dest, or set "
+                     "$CODEX_BACKUP_DEST."))
+    return root
+
+
+# ── session discovery + metadata ───────────────────────────────────────────────
+class Session:
+    __slots__ = ("rel", "path", "size", "mtime", "cwd", "date")
+
+    def __init__(self, rel: Path, path: Path):
+        self.rel = rel
+        self.path = path
+        st = path.stat()
+        self.size = st.st_size
+        self.mtime = st.st_mtime
+        self.cwd = ""
+        # date from the path (YYYY/MM/DD/...), fall back to mtime.
+        parts = rel.parts
+        if len(parts) >= 3 and parts[0].isdigit():
+            self.date = f"{parts[0]}-{parts[1]}-{parts[2]}"
+        else:
+            self.date = datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d")
+
+    @property
+    def idle_days(self) -> int:
+        return max(0, int((now_ts() - self.mtime) // 86400))
+
+    def read_cwd(self) -> str:
+        """Project directory from the session_meta on the first JSONL line."""
+        if self.cwd:
+            return self.cwd
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+            obj = json.loads(first)
+            self.cwd = str(obj.get("payload", {}).get("cwd", "") or obj.get("cwd", ""))
+        except Exception:
+            self.cwd = ""
+        return self.cwd
+
+
+def discover(src: Path = SRC) -> list[Session]:
+    if not src.is_dir():
+        return []
+    out = []
+    for p in src.rglob("*.jsonl"):
+        if p.is_file():
+            out.append(Session(p.relative_to(src), p))
+    out.sort(key=lambda s: s.mtime, reverse=True)
+    return out
+
+
+# ── age buckets ─────────────────────────────────────────────────────────────────
+BUCKETS = [
+    ("45+ days idle", lambda d: d >= 45),
+    ("30-45 days",    lambda d: 30 <= d < 45),
+    ("15-30 days",    lambda d: 15 <= d < 30),
+    ("< 15 days",     lambda d: d < 15),
+]
+
+
+def bucket_of(idle: int) -> str:
+    for name, pred in BUCKETS:
+        if pred(idle):
+            return name
+    return "< 15 days"
+
+
+# ── rsync ────────────────────────────────────────────────────────────────────
+def rsync_exe() -> str:
+    for cand in ("/opt/homebrew/bin/rsync", "/usr/local/bin/rsync"):
+        if os.path.exists(cand):
+            return cand
+    return shutil.which("rsync") or "/usr/bin/rsync"
+
+
+def rsync_is_gnu3(exe: str) -> bool:
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+        return "version 3" in out or "version 4" in out
+    except Exception:
+        return False
+
+
+# ── backup-status lookup ─────────────────────────────────────────────────────
+def backup_status(sess: Session, dest_dir: Path) -> tuple[bool, int]:
+    """(present_and_size_matches, backup_size). backup_size is -1 if absent."""
+    bp = dest_dir / sess.rel
+    try:
+        bsize = bp.stat().st_size
+    except OSError:
+        return (False, -1)
+    return (bsize == sess.size, bsize)
+
+
+# ── index ────────────────────────────────────────────────────────────────────
+def build_index(sessions: list[Session], dest_dir: Path | None) -> dict:
+    records = []
+    for s in sessions:
+        backed, bsize = (False, -1)
+        if dest_dir is not None:
+            backed, bsize = backup_status(s, dest_dir)
+        records.append({
+            "rel": str(s.rel),
+            "date": s.date,
+            "size": s.size,
+            "mtime": s.mtime,
+            "idle_days": s.idle_days,
+            "cwd": s.read_cwd(),
+            "bucket": bucket_of(s.idle_days),
+            "backed_up": backed,
+            "backup_size": bsize,
+        })
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": str(SRC),
+        "backup_root": str(dest_dir.parent) if dest_dir else None,
+        "count": len(records),
+        "total_size": sum(r["size"] for r in records),
+        "sessions": records,
+    }
+
+
+def write_index_files(index: dict, dest_dir: Path | None):
+    LOCAL_INDEX.parent.mkdir(parents=True, exist_ok=True)
+    LOCAL_INDEX.write_text(json.dumps(index, indent=2))
+    if dest_dir is not None:
+        try:
+            root = dest_dir.parent
+            (root / "codex-index.json").write_text(json.dumps(index, indent=2))
+            _write_tsv(index, root / "codex-index.tsv")
+        except OSError as e:
+            print(yellow(f"  ! could not write index to backup: {e}"))
+
+
+def _write_tsv(index: dict, path: Path):
+    lines = ["date\tidle_days\tbucket\tsize\tbacked_up\tcwd\trel"]
+    for r in index["sessions"]:
+        lines.append("\t".join([
+            r["date"], str(r["idle_days"]), r["bucket"], str(r["size"]),
+            "Y" if r["backed_up"] else "N", r["cwd"], r["rel"],
+        ]))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def print_index_summary(index: dict, dest_dir: Path | None):
+    recs = index["sessions"]
+    print(bold(f"\nCodex sessions — {index['count']} files, "
+               f"{human(index['total_size'])} total"))
+    if dest_dir is None:
+        print(dim("  (no backup drive resolved — backup status unknown)"))
+    print()
+    hdr = f"  {'bucket':<16}{'files':>7}{'size':>10}{'backed up':>12}{'reclaimable':>14}"
+    print(bold(hdr))
+    print(dim("  " + "-" * (len(hdr) - 2)))
+    for name, _ in BUCKETS:
+        bucket_recs = [r for r in recs if r["bucket"] == name]
+        if not bucket_recs:
+            continue
+        files = len(bucket_recs)
+        size = sum(r["size"] for r in bucket_recs)
+        nbk = sum(1 for r in bucket_recs if r["backed_up"])
+        # reclaimable = backed-up bytes in this bucket (safe to prune locally)
+        reclaim = sum(r["size"] for r in bucket_recs if r["backed_up"])
+        bk = f"{nbk}/{files}"
+        colour = green if nbk == files else (yellow if nbk else red)
+        print(f"  {name:<16}{files:>7}{human(size):>10}{colour(bk):>{12 + (len(colour(bk)) - len(bk))}}"
+              f"{human(reclaim):>14}")
+    print()
+    total_bk = sum(1 for r in recs if r["backed_up"])
+    print(dim(f"  {total_bk}/{index['count']} sessions verified in backup"
+              + (f"  →  {dim(str(dest_dir.parent))}" if dest_dir else "")))
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+def cmd_backup(args):
+    if not SRC.is_dir():
+        if args.quiet:
+            return 0
+        sys.exit(red(f"No sessions to back up: {SRC} does not exist."))
+    root = find_backup_root(getattr(args, "dest", None))
+    if not root_available(root):
+        if args.quiet:
+            return 0  # scheduled run, drive not mounted — nothing to do
+        return require_backup_root(args)  # prints the actionable error and exits
+    dest = sessions_dest(root)
+    dest.mkdir(parents=True, exist_ok=True)
+    exe = rsync_exe()
+    cmd = [exe, "-a", "--partial", "--human-readable"]
+    if not args.quiet and _TTY and rsync_is_gnu3(exe):
+        cmd.append("--info=progress2")
+    if args.dry_run:
+        cmd.append("--dry-run")
+    cmd += [str(SRC) + "/", str(dest) + "/"]
+    if not args.quiet:
+        print(bold(f"Backing up {dim(str(SRC))} → {dim(str(dest))}"))
+        print(dim(f"  rsync: {exe}"))
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        sys.exit(red(f"rsync failed (rc={rc}). Backup NOT complete — nothing pruned."))
+    # refresh index after a real backup
+    if not args.dry_run:
+        idx = build_index(discover(), dest)
+        write_index_files(idx, dest)
+        if not args.quiet:
+            print(green(f"\n✓ Backup complete. Index written."))
+            print_index_summary(idx, dest)
+    return 0
+
+
+def cmd_index(args):
+    root = find_backup_root(getattr(args, "dest", None))
+    dest = sessions_dest(root) if root else None
+    idx = build_index(discover(), dest)
+    write_index_files(idx, dest)
+    if args.json:
+        print(json.dumps(idx, indent=2))
+    else:
+        print_index_summary(idx, dest)
+    return 0
+
+
+def cmd_verify(args):
+    root = require_backup_root(args)
+    dest = sessions_dest(root)
+    sessions = discover()
+    missing, mismatch, ok = [], [], 0
+    for s in sessions:
+        backed, bsize = backup_status(s, dest)
+        if bsize == -1:
+            missing.append(s)
+        elif not backed:
+            mismatch.append((s, bsize))
+        else:
+            ok += 1
+    # backup-only files (present in backup, gone locally) — restorable
+    local_rels = {str(s.rel) for s in sessions}
+    backup_only = []
+    if dest.is_dir():
+        for p in dest.rglob("*.jsonl"):
+            rel = str(p.relative_to(dest))
+            if rel not in local_rels:
+                backup_only.append((rel, p.stat().st_size))
+    print(bold(f"\nVerify: {len(sessions)} local sessions vs {dim(str(dest))}"))
+    print(f"  {green('✓ verified')}    {ok}")
+    print(f"  {(red if missing else dim)('✗ not backed up')} {len(missing)}"
+          + (f"   {human(sum(s.size for s in missing))}" if missing else ""))
+    print(f"  {(yellow if mismatch else dim)('! size mismatch')} {len(mismatch)}")
+    print(f"  {dim('↩ backup-only (restorable)')} {len(backup_only)}"
+          + (f"   {human(sum(sz for _, sz in backup_only))}" if backup_only else ""))
+    if missing and args.verbose:
+        print(dim("\n  not backed up:"))
+        for s in missing[:50]:
+            print(f"    {s.rel}")
+    if mismatch and args.verbose:
+        print(dim("\n  size mismatch (local vs backup):"))
+        for s, bsize in mismatch[:50]:
+            print(f"    {s.rel}  {human(s.size)} vs {human(bsize)}")
+    return 1 if (missing or mismatch) else 0
+
+
+def cmd_prune(args):
+    root = require_backup_root(args)
+    dest = sessions_dest(root)
+    sessions = discover()
+    threshold = args.older_than
+    keep = args.keep_recent
+    # keep the N newest overall regardless of age
+    protected = {str(s.rel) for s in sessions[:keep]}
+
+    candidates, unsafe = [], []
+    for s in sessions:
+        if str(s.rel) in protected:
+            continue
+        if s.idle_days < threshold:
+            continue
+        backed, bsize = backup_status(s, dest)
+        if args.checksum and backed:
+            backed = _files_identical(s.path, dest / s.rel)
+        if backed:
+            candidates.append(s)
+        else:
+            unsafe.append(s)
+
+    reclaim = sum(s.size for s in candidates)
+    print(bold(f"\nPrune plan — local sessions idle ≥ {threshold} days "
+               f"(keeping {keep} newest)"))
+    print(f"  {green('safe to delete (verified in backup)')}: "
+          f"{len(candidates)} files, {bold(human(reclaim))}")
+    if unsafe:
+        print(f"  {red('NOT backed up — will be kept')}: "
+              f"{len(unsafe)} files, {human(sum(s.size for s in unsafe))}")
+
+    if args.verbose or not args.apply:
+        by_cwd: dict[str, list[Session]] = {}
+        for s in candidates:
+            by_cwd.setdefault(s.read_cwd() or "(unknown)", []).append(s)
+        for cwd in sorted(by_cwd, key=lambda k: -sum(x.size for x in by_cwd[k])):
+            grp = by_cwd[cwd]
+            print(dim(f"\n  {cwd}  —  {len(grp)} files, {human(sum(x.size for x in grp))}"))
+            for s in sorted(grp, key=lambda x: x.mtime)[:8]:
+                print(f"    {s.date}  {human(s.size):>8}  idle {s.idle_days}d  {s.rel}")
+            if len(grp) > 8:
+                print(dim(f"    … +{len(grp) - 8} more"))
+
+    if unsafe and args.verbose:
+        print(red("\n  kept (no verified backup):"))
+        for s in unsafe[:20]:
+            print(f"    {s.date}  {human(s.size):>8}  {s.rel}")
+
+    if not args.apply:
+        print(yellow(f"\n  Dry-run. Re-run with --apply to delete the "
+                     f"{len(candidates)} verified files and free {human(reclaim)}."))
+        return 0
+
+    if not candidates:
+        print(dim("\n  Nothing to prune."))
+        return 0
+
+    deleted, freed = 0, 0
+    for s in candidates:
+        # re-verify at delete time — the backup is the safety net
+        backed, _ = backup_status(s, dest)
+        if not backed:
+            print(yellow(f"  ! skip (backup vanished): {s.rel}"))
+            continue
+        try:
+            sz = s.path.stat().st_size
+            s.path.unlink()
+            deleted += 1
+            freed += sz
+        except OSError as e:
+            print(red(f"  ✗ {s.rel}: {e}"))
+    _prune_empty_dirs(SRC)
+    print(green(f"\n✓ Deleted {deleted} sessions, freed {human(freed)}. "
+                f"Backup retains every copy."))
+    # refresh index
+    idx = build_index(discover(), dest)
+    write_index_files(idx, dest)
+    return 0
+
+
+def cmd_restore(args):
+    root = require_backup_root(args)
+    dest = sessions_dest(root)
+    if not dest.is_dir():
+        sys.exit(red(f"Backup not found: {dest}"))
+    target_root = Path(args.to).expanduser() if args.to else SRC
+
+    # enumerate backup sessions
+    backup_files = [p for p in dest.rglob("*.jsonl") if p.is_file()]
+    sel = []
+    for p in backup_files:
+        rel = p.relative_to(dest)
+        if args.all:
+            sel.append((rel, p))
+            continue
+        if args.date and args.date.replace("-", "/") in str(rel):
+            sel.append((rel, p)); continue
+        if args.uuid and args.uuid in p.name:
+            sel.append((rel, p)); continue
+        if args.cwd:
+            try:
+                first = p.open("r", encoding="utf-8", errors="replace").readline()
+                cwd = json.loads(first).get("payload", {}).get("cwd", "")
+            except Exception:
+                cwd = ""
+            if args.cwd in cwd:
+                sel.append((rel, p))
+            continue
+
+    if not sel:
+        sys.exit(red("No matching sessions in backup for that selector."))
+
+    print(bold(f"\nRestore {len(sel)} sessions → {dim(str(target_root))}"))
+    restored, skipped, total = 0, 0, 0
+    for rel, src_path in sorted(sel, key=lambda x: str(x[0])):
+        out = target_root / rel
+        if out.exists() and not args.force:
+            if out.stat().st_mtime >= src_path.stat().st_mtime:
+                skipped += 1
+                continue
+        total += src_path.stat().st_size
+        if args.dry_run:
+            print(dim(f"  would restore {rel}"))
+            restored += 1
+            continue
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, out)
+        restored += 1
+    verb = "would restore" if args.dry_run else "restored"
+    print(green(f"  ✓ {verb} {restored} files ({human(total)}), skipped {skipped} "
+                f"(newer/existing local; use --force to overwrite)"))
+    return 0
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+def _files_identical(a: Path, b: Path) -> bool:
+    import filecmp
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def _prune_empty_dirs(root: Path):
+    for d in sorted((p for p in root.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        try:
+            next(d.iterdir())
+        except StopIteration:
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+
+
+# ── argument parsing ────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="codex-backup",
+        description="Back up, index, prune, and restore ~/.codex/sessions.",
+    )
+    # --dest is shared by every subcommand so `codex-backup backup --dest X` works.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dest", help="backup root (the mac-optimize-backups dir)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("backup", parents=[common],
+                       help="rsync sessions to the external drive (cumulative)")
+    b.add_argument("--dry-run", action="store_true")
+    b.add_argument("--quiet", action="store_true", help="for scheduled/launchd runs")
+    b.set_defaults(func=cmd_backup)
+
+    i = sub.add_parser("index", parents=[common],
+                       help="inventory sessions with age buckets + backup status")
+    i.add_argument("--json", action="store_true")
+    i.set_defaults(func=cmd_index)
+
+    v = sub.add_parser("verify", parents=[common],
+                       help="compare local vs backup, report drift")
+    v.add_argument("-v", "--verbose", action="store_true")
+    v.set_defaults(func=cmd_verify)
+
+    pr = sub.add_parser("prune", parents=[common],
+                        help="delete local sessions idle > N days (verified in backup)")
+    pr.add_argument("--older-than", type=int, required=True, metavar="DAYS",
+                    help="delete sessions idle at least this many days")
+    pr.add_argument("--keep-recent", type=int, default=5, metavar="N",
+                    help="always keep the N newest sessions (default 5)")
+    pr.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
+    pr.add_argument("--checksum", action="store_true",
+                    help="byte-compare each file against its backup before deleting")
+    pr.add_argument("-v", "--verbose", action="store_true")
+    pr.set_defaults(func=cmd_prune)
+
+    rs = sub.add_parser("restore", parents=[common],
+                        help="copy sessions back from the backup")
+    g = rs.add_mutually_exclusive_group(required=True)
+    g.add_argument("--all", action="store_true")
+    g.add_argument("--date", metavar="YYYY-MM-DD")
+    g.add_argument("--uuid", metavar="SUBSTR")
+    g.add_argument("--cwd", metavar="SUBSTR", help="match sessions whose project path contains SUBSTR")
+    rs.add_argument("--to", help="restore into this dir instead of ~/.codex/sessions")
+    rs.add_argument("--force", action="store_true", help="overwrite newer local files")
+    rs.add_argument("--dry-run", action="store_true")
+    rs.set_defaults(func=cmd_restore)
+
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except KeyboardInterrupt:
+        print(red("\ninterrupted"), file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

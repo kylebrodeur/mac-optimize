@@ -14,24 +14,16 @@ The design goal, borrowed from that writeup, is to **change the shape of the fai
 
 ## Install
 
-**Homebrew** (macOS):
-
-```bash
-brew install kylebrodeur/tap/mac-optimize
-```
-
-Homebrew installs the tools and the shared library, but does **not** manage the
-scheduled automation (it needs per-user paths). `brew info mac-optimize` prints the exact
-commands, or use the clone method below to have `install.sh` do it.
-
-**From a clone** — also sets up the automation:
-
 ```bash
 git clone https://github.com/kylebrodeur/mac-optimize.git
 cd mac-optimize
-make install
-make doctor
+make install          # deploy tools to ~/.local/bin + load the launchd agents
+make doctor           # verify the install
 ```
+
+Pure clone-and-`make` — no tap, no package manager. `install.sh` copies the
+tools into `~/.local/bin`, vendors the shared library, and loads the launchd
+automation with your per-user paths filled in. Re-running it is safe.
 
 ## Quickstart
 
@@ -57,6 +49,7 @@ worktree-audit        # find stray git worktrees
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
 | **`memguard`** | The memory analog of `diskguard` (the real `earlyoom` port). A launchd watcher at login + every 5 min: it reads the kernel's own memory-pressure level (`kern.memorystatus_vm_pressure_level`) and free-RAM %, and at the warn/critical thresholds posts a non-blocking notification **naming the largest RAM consumer** so you can act before jetsam picks the victim. **Never kills a process or deletes app state.** In the disk↔swap coupling quadrant (RAM tight *and* disk too low for swap to grow — the state that force-panicked one of these machines via a `watchdogd` timeout) it now also auto-triggers `mac-reclaim`'s SAFE tier immediately (same rebuildable-cache-only tier `diskguard` already runs on its own schedule, just sooner) and nags every cycle instead of every 30 min until the coupling clears. |
+| **`codex-backup`** | Backs up, indexes, prunes, and restores `~/.codex/sessions` — the large single-copy JSONL logs Codex writes per run (10 GB+ is normal). `backup` rsyncs them to an external drive **cumulatively** (never `--delete`), so a later prune frees local space while the backup keeps everything. `index` inventories every session by age bucket (45+/30-45/15-30/<15 days idle), size, project (`cwd`), and backup status. `prune --older-than N` deletes local sessions idle ≥ N days **only when verified present in the backup** — dry-run by default, keeps the N newest, and never touches anything not backed up. `restore` copies sessions back by date/uuid/project/all and never clobbers a newer local file. `verify` reports drift. Resolves the drive from `--dest`, `$CODEX_BACKUP_DEST`, `~/.config/mac-optimize/codex-backup.conf`, or the first mounted volume with a `mac-optimize-backups/` folder; a weekly launchd agent runs `backup --quiet` and no-ops when the drive is absent. |
 | **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
 
 ## How it works
