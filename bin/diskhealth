@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# diskhealth — SMART + filesystem health for the SSDs in this Mac.
+# Read-only. Wraps smartctl (smartmontools) and, with --verify, diskutil
+# verifyVolume. Flags wear, temperature, media errors, and the
+# power-cycle/unsafe-shutdown pattern that kills external drives.
+#
+# Usage:
+#   diskhealth            SMART summary for every physical SSD
+#   diskhealth --verify   also run a read-only filesystem check on mounted volumes
+#
+# Requires smartmontools: brew install smartmontools
+
+set -uo pipefail
+
+hr() { printf '%s\n' "──────────────────────────────────────────────"; }
+section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
+bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; }
+dim()  { printf '  \033[2m%s\033[0m\n' "$1"; }
+
+VERIFY=0
+for a in "${@:-}"; do
+  case "$a" in
+    --verify) VERIFY=1 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+  esac
+done
+
+if ! command -v smartctl >/dev/null 2>&1; then
+  echo "smartctl not found — install with: brew install smartmontools"
+  exit 1
+fi
+
+# Extract the value after an exact label in smartctl output ("Label: value").
+val() { printf '%s\n' "$1" | awk -F: -v k="$2" '$1 == k {gsub(/^[ \t]+/,"",$2); print $2; exit}'; }
+# Digits only, for numeric comparison ("34 Celsius" -> 34, "17,180" -> 17180).
+num() { printf '%s\n' "$1" | tr -dc '0-9'; }
+
+# Physical disks: the /dev/diskN entries marked physical.
+disks=$(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+ .*physical/ {print $1}')
+[ -z "$disks" ] && { echo "no physical disks found"; exit 1; }
+
+for d in $disks; do
+  out=$(smartctl -a "$d" 2>/dev/null) || { dim "skipping $d (no SMART via this interface)"; continue; }
+  model=$(val "$out" "Model Number")
+  [ -z "$model" ] && { dim "skipping $d (no SMART data)"; continue; }
+
+  health=$(printf '%s\n' "$out" | grep -i 'overall-health' | awk -F: '{gsub(/^[ \t]+/,"",$2); print $2}')
+  crit=$(val "$out" "Critical Warning")
+  temp=$(val "$out" "Temperature")
+  spare=$(val "$out" "Available Spare")
+  used=$(val "$out" "Percentage Used")
+  media=$(val "$out" "Media and Data Integrity Errors")
+  cycles=$(val "$out" "Power Cycles")
+  unsafe=$(val "$out" "Unsafe Shutdowns")
+  hours=$(val "$out" "Power On Hours")
+
+  section "$model  ($d)"
+
+  case "$health" in
+    *PASSED*) ok "SMART health: PASSED" ;;
+    *) bad "SMART health: ${health:-unknown}" ;;
+  esac
+
+  [ "$crit" = "0x00" ] && ok "Critical warning: none" || bad "Critical warning: ${crit}"
+
+  t=$(num "$temp"); [ -n "$t" ] && { [ "$t" -le 60 ] && ok "Temperature: ${temp}" || warn "Temperature: ${temp} (hot)"; }
+
+  s=$(num "$spare"); [ -n "$s" ] && { [ "$s" -ge 20 ] && ok "Available spare: ${spare}" || warn "Available spare: ${spare} (low)"; }
+
+  u=$(num "$used"); [ -n "$u" ] && { [ "$u" -le 80 ] && ok "Wear (percentage used): ${used}" || warn "Wear: ${used} (high)"; }
+
+  m=$(num "$media"); [ -n "$m" ] && { [ "$m" -eq 0 ] && ok "Media/data integrity errors: 0" || bad "Media errors: ${media}"; }
+
+  c=$(num "$cycles"); h=$(num "$hours")
+  if [ -n "$c" ] && [ -n "$h" ] && [ "$h" -gt 0 ]; then
+    rate=$(( c * 100 / h ))   # cycles/hour * 100
+    if [ "$rate" -gt 200 ]; then
+      warn "Power cycles: ${cycles} over ${hours}h (~$((rate/100)).$((rate%100))/h) — power-cycling abnormally"
+    else
+      ok "Power cycles: ${cycles} over ${hours}h"
+    fi
+  fi
+
+  us=$(num "$unsafe"); [ -n "$us" ] && { [ "$us" -le 100 ] && ok "Unsafe shutdowns: ${unsafe}" || warn "Unsafe shutdowns: ${unsafe} — eject before unplugging"; }
+
+  hr
+done
+
+if [ "$VERIFY" = 1 ]; then
+  section "Filesystem check (read-only)"
+  for v in $(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+s[0-9]+/ {print $1}'); do
+    mp=$(diskutil info "$v" 2>/dev/null | awk -F: '/Mount Point/{gsub(/^[ \t]+/,"",$2); print $2}')
+    [ -n "$mp" ] && [ "$mp" != "Not applicable (no file system)" ] && {
+      echo "  $v ($mp)"
+      diskutil verifyVolume "$v" 2>&1 | tail -2 | sed 's/^/    /'
+    }
+  done
+  hr
+fi

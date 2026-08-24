@@ -32,6 +32,14 @@ All notable changes to **mac-optimize** are documented here. The format follows
   drift. Ships a weekly launchd agent that runs `backup --quiet` and no-ops when
   the drive is unmounted. Python 3 stdlib, prefers Homebrew rsync 3.x when
   present. Covered by `test/codex-backup-test.sh` (23 assertions).
+- **`diskhealth`** — read-only SMART + filesystem health for the SSDs in the
+  Mac. Wraps `smartctl` (smartmontools) to report overall health, temperature,
+  available spare, wear (percentage used), media errors, and the
+  power-cycle/unsafe-shutdown pattern that catches external drives being yanked
+  from power (a drive power-cycling ~10×/hour or with hundreds of unsafe
+  shutdowns is a power-management problem, not a failing drive). `--verify`
+  adds a read-only `diskutil verifyVolume` on mounted volumes. Requires
+  `brew install smartmontools`. Wired into `doctor`.
 
 ### Changed
 - **`memguard`** now auto-triggers `mac-reclaim`'s SAFE tier immediately (own
