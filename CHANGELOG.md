@@ -6,6 +6,8 @@ All notable changes to **mac-optimize** are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-24
+
 ### Added
 - **`memguard`** — a launchd memory-pressure watcher (login + every 5 min), the
   memory analog of `diskguard` and the other half of the `earlyoom` lesson. Reads
@@ -100,5 +102,6 @@ All notable changes to **mac-optimize** are documented here. The format follows
 - launchd automation (`diskguard`, weekly `mac-reclaim`) and a `TESTING.md`
   clone-to-uninstall verification guide.
 
-[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/kylebrodeur/mac-optimize/releases/tag/v1.0.0
