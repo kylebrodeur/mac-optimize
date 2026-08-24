@@ -1,7 +1,7 @@
 ---
 name: mac-optimize
-description: Diagnose and reclaim disk space, audit stray git worktrees, back up and prune Codex agent sessions, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", "find/clean git worktrees", "back up my codex sessions", or "prune old codex/agent sessions"; or for routine maintenance. Drives the diskreport, mac-reclaim, worktree-audit, and codex-backup command-line tools with a safety-first workflow.
-compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit, codex-backup). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
+description: Diagnose and reclaim disk space, audit stray git worktrees, back up and prune Codex agent sessions, check SSD health, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", "find/clean git worktrees", "back up my codex sessions", "prune old codex/agent sessions", or "check my SSD/drive health"; or for routine maintenance. Drives the diskreport, mac-reclaim, worktree-audit, codex-backup, and diskhealth command-line tools with a safety-first workflow.
+compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit, codex-backup, diskhealth). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
 license: MIT
 metadata:
   author: kylebrodeur
@@ -33,6 +33,15 @@ ncdu [PATH]                  # interactive instead — navigate, sort, delete in
 Both require Homebrew (`brew install ncdu dust`); `diskreport --scan` prints a hint instead of failing
 if `dust` isn't installed. Still read-only/manual — `ncdu`'s delete key is a human action, not something
 to script unattended.
+
+For SSD health (wear, temperature, and the power-cycle/unsafe-shutdown pattern that catches external drives being yanked from power):
+
+```
+diskhealth            # SMART summary for every physical SSD (needs: brew install smartmontools)
+diskhealth --verify   # + read-only filesystem check on mounted volumes
+```
+
+Read-only. A drive power-cycling ~10×/hour or with hundreds of unsafe shutdowns is a power-delivery problem (bus-powered enclosure losing 5V-3A), not a failing drive — check the cable, port, and whether the Mac is on battery before assuming the flash is dying.
 
 ## 2. Reclaim safe caches
 
