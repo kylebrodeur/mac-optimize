@@ -3,8 +3,7 @@
 End-to-end verification on macOS: clone → install → run → maintain → uninstall.
 
 > **Read this first.** This procedure is the durable macOS verification checklist
-> for the shared `agent-machine-lib` adoption. The first macOS pass ran on
-> 2026-07-31; its results are recorded below. Every destructive step is gated
+> for the shared `agent-machine-lib` adoption. Every destructive step is gated
 > behind a dry-run whose correctness you assert before proceeding. If a **STOP**
 > check fails, stop and report it.
 
@@ -432,108 +431,49 @@ free space after 4c:
 Anything unexpected:
 ```
 
-Report failures with the exact command, its full output, and which STOP check tripped.
+Report failures with the exact command and full output in the private session
+record; summarize only the sanitized failure and STOP check in public changes.
 
-## Results — 2026-07-31 macOS verification
+## Results
 
-```
-macOS:            26.5.2 (25F84)
-bash:             GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)
-free space before: 17Gi at prerequisite check; 19Gi at diskreport after install-triggered reclaim
-free space after 4c: 21Gi
+Do not commit output from a live workstation to this repository. Record the
+machine-specific results, timestamps, process IDs, disk paths, and diagnostic
+logs in a private session note instead. The public repository should contain
+the procedure and reproducible assertions, not an operator's inventory.
 
-2  parse                 pass
-2  library isolation     AM_PLATFORM=macos  am_mtime=1785542320  am_idle_days=0
-2  am_stale_entries      keep0 listed old? Y   keep5 empty? Y
-3  make install          pass
-3  make doctor           passed=9   failed=0
-3a installed vs repo     counts match? Y (installed=5 repo=5)
-4a diskreport            ran clean? Y
-4b dry-run delta KiB     inconclusive under launchd race: +2160348, then +1659184
-4b shared tier shown?    Y   brew shown in real env; bun shown with dry-run no-op bun shim
-4c mac-reclaim reclaimed 712 MiB; immediate rerun reclaimed 1 MiB
-4d deep tier             candidates=123  accepted=0 (skipped pending human review)
-4e worktree-audit        SAFE=3   REVIEW=0   hand-verified a SAFE row? Y
-4e backup round-trip     bundle verify pass? skipped (no backup flow used)
-5  vendor-lib drift      fixed: marker and bytes now match agent-machine-lib@f5a959b0fe635a27ceb402cee3f9595dbae22db7
-5  install idempotent    Y (diskguard PID 39726 -> 40441 -> 40482)
-6  uninstall residue     bins=0  lib=0  agents=0  plists=0; tools reinstalled afterward
+For a release verification snapshot, record only aggregate pass/fail outcomes
+and the exact test commands:
 
-Anything unexpected:
-- Found and fixed a shared `WORKTREE_ROOTS` safety bug: env roots were additive with default roots, so an explicit constrained root or nonexistent root could still scan default roots. Fixed in `agent-machine-lib`, added regression coverage for env root, nonexistent env root, and positional-root precedence, then re-vendored `mac-optimize` and `wsl-optimize`.
-- The real environment lacks `bun`, so the literal `would: bun pm cache rm` branch was verified with a temporary no-op `bun` shim; dry-run did not invoke the shim.
-- `make install` starts `diskguard` with `RunAtLoad`; while disk was below the warning threshold it ran real safe reclaim concurrently with §4b dry-run measurements. TESTING.md now requires waiting for `diskguard` to go idle before delta measurement.
-- A later deep dry-run attempt hung in the candidate scan and was killed (`bash ./bin/mac-reclaim --deep --dry-run`, pid 43932). Do not treat §4b delta verification as clean until rerun after `diskguard` is idle and the scan completes.
-- `WORKTREE_ROOTS="$HOME/some/other/dir" worktree-audit` previously looked like it worked while still scanning defaults. The fixed behavior now treats `WORKTREE_ROOTS` as the constrained scan root.
-- Historical `diskguard.log` tail includes older `rm: ... .npm/_cacache ... Directory not empty` lines from 2026-07-30, before this verification run.
-- Operational stability note for gist/writeup: user-observed outcome during this
-  macOS run was no significant crash, out-of-memory incident, or Force Quit “apps
-  paused” event. Telemetry snapshot at `2026-07-31 20:58 CDT (-0500)` covered a
-  machine up for `1 day, 6:19` since `Thu Jul 30 14:39:11 2026`:
-  `memory_pressure -Q` reported `46%` system-wide memory free; `sysctl
-  vm.swapusage` reported `5120.00M` total swap with `4721.75M` used. On macOS,
-  swap-used can include retained pages from earlier transient pressure, so pair it
-  with the contemporaneous memory-free value and do not read it as current OOM.
-  DiagnosticReports files modified in the last six hours counted `0` crash/IPS,
-  `0` panic-named, and `0` hang/spin-named reports. A
-  six-hour unified-log scan still showed RunningBoard/memorystatus bookkeeping
-  messages, and macOS log retention/filtering is not a complete absence proof.
+```text
+make test                         pass/fail
+bash test/mac-safemode-test.sh   pass/fail
+make doctor                      passed/failed
 ```
 
-### Remaining manual checks from 2026-07-31
+If a check fails, keep the complete output in the private note and report the
+failure without copying user paths, hostnames, usernames, tokens, or raw logs
+into this repository.
 
-The first macOS pass intentionally did not run destructive or interactive cleanup
-against Kyle's live state. Finish the remaining review in separate steps; do not
-paste a dry-run and deletion command together.
+## Safe Mode benchmark workflow
 
-1. Wait for `diskguard` to be idle, then capture a measured deep dry-run:
+The Safe Mode tool is intentionally interactive and non-destructive:
 
 ```bash
-(
-set -euo pipefail
-while launchctl list | awk '/com\.mac-optimize\.diskguard/ && $1 != "-" {found=1} END{exit !found}'; do
-  echo "waiting for diskguard to finish…"
-  sleep 5
-done
-
-before=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
-./bin/mac-reclaim --deep --dry-run | tee /tmp/mac-optimize-deep-dry-run.txt
-after=$(df -Pk /System/Volumes/Data | awk 'NR==2{print $4}')
-echo "delta KiB: $((after-before))    # must be ~0"
-)
+mac-safemode prepare
+# follow Apple's Startup Options instructions, then:
+mac-safemode finish       # while running in Safe Mode
+# restart normally, then:
+mac-safemode finish       # writes the comparison report
 ```
 
-Stop here and review `/tmp/mac-optimize-deep-dry-run.txt`. Continue only if every
-candidate reason is understood and the delta is approximately zero.
+The tool persists its state under the user's macOS Application Support
+directory, outside `/tmp`, and writes private JSON plus a Markdown comparison
+report. It does not change NVRAM or boot policy, kill processes, delete data,
+or request a reboot unless `--reboot` is explicitly supplied and confirmed.
 
-2. If the deep dry-run is accepted, run the prompted deep tier:
+## Remaining manual checks
 
-```bash
-mac-reclaim --deep
-```
-
-`~/Library/Application Support/Code/User/workspaceStorage` remains
-REVIEW/protected and is never deleted by `mac-reclaim`; see the §4d guard. Any
-future prune workflow for those paths requires the backup spec at
-`docs/superpowers/specs/2026-08-01-vscode-chat-backup-design.md` to pass restore,
-fingerprint, and hostile-archive gates first.
-
-3. Worktree cleanup is separate. Audit first:
-
-```bash
-worktree-audit
-```
-
-Then verify one SAFE row as described in §4e. After that, choose only the
-operation you intend:
-
-```bash
-worktree-audit --backup     # only if REVIEW rows should be archived
-```
-
-```bash
-worktree-audit --prune      # only if SAFE rows should be removed
-```
-
-Do **not** run `mac-reclaim --deep --yes` or `worktree-audit --backup --prune --yes`
-on live state unless the dry-run/audit output has already been reviewed.
+The deep reclaim and worktree operations remain intentionally separate from
+this verification procedure. Run their dry-run or audit forms first, inspect
+the output, and only then choose an explicit destructive operation. Never
+commit live output from those checks.

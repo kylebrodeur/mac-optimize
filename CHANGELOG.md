@@ -6,7 +6,26 @@ All notable changes to **mac-optimize** are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-08-24
+## [1.2.0] - 2026-08-30
+
+### Added
+- **`session-backup`** — on-demand, copy-only, profile-driven backups for Pi,
+  OMP, Claude Code, and Claude Desktop persistent state. OMP and Claude Code
+  parent transcripts are backed up with their coupled sidecars; manifests use
+  SHA-256 hashes and atomic private writes. Claude Desktop VM bundles and
+  caches are excluded. No launchd service or automatic pruning is installed.
+- **`mac-safemode`** — guided, evidence-first Safe Mode benchmark workflow. Captures
+  before/Safe Mode/normal boot state (disk, APFS, memory, swap, monitored
+  processes, and home-root sizes), persists state outside `/tmp`, prints Apple's
+  supported Apple silicon Startup Options steps, and writes a Markdown
+  comparison report. It never changes NVRAM or boot policy, kills processes,
+  deletes data, or reboots without explicit confirmation.
+
+### Documentation
+- Removed machine-specific audit output from the public tree and moved operator
+  session details to private notes. `TESTING.md` now documents reproducible
+  procedures and aggregate results without usernames, hostnames, local paths,
+  process IDs, raw logs, or credentials.
 
 ### Added
 - **`memguard`** — a launchd memory-pressure watcher (login + every 5 min), the
@@ -102,6 +121,7 @@ All notable changes to **mac-optimize** are documented here. The format follows
 - launchd automation (`diskguard`, weekly `mac-reclaim`) and a `TESTING.md`
   clone-to-uninstall verification guide.
 
-[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/kylebrodeur/mac-optimize/releases/tag/v1.0.0

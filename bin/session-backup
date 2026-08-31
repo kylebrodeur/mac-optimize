@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""On-demand backups for agent session history on macOS.
+
+Profiles copy durable session units to an external mac-optimize-backups drive:
+Pi, OMP, Claude Code, and Claude Desktop. The command is intentionally
+copy-only: it never schedules itself and never prunes source data.
+
+Session transcripts contain prompts, tool output, and sometimes secrets. Backup
+roots and profile directories are created private (0700), files private (0600),
+and no transcript content is printed.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG = Path.home() / ".config" / "mac-optimize" / "session-backup.conf"
+BACKUP_DIRNAME = "session-backups"
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    label: str
+    root: Path
+    mode: str
+    excludes: tuple[str, ...] = ()
+
+
+@dataclass
+class Unit:
+    key: str
+    coupled: bool
+    files: list[tuple[Path, Path]]
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+
+
+def profile_specs() -> dict[str, tuple[str, tuple[SourceSpec, ...]]]:
+    home = home_dir()
+    return {
+        "pi": (
+            "Pi durable JSONL sessions",
+            (SourceSpec("", home / ".pi" / "agent" / "sessions", "jsonl"),),
+        ),
+        "omp": (
+            "OMP sessions with coupled sidecars",
+            (SourceSpec("", home / ".omp" / "agent" / "sessions", "coupled"),),
+        ),
+        "claude-code": (
+            "Claude Code transcripts and file history",
+            (
+                SourceSpec("projects", home / ".claude" / "projects", "coupled"),
+                SourceSpec("file-history", home / ".claude" / "file-history", "tree"),
+            ),
+        ),
+        "claude-desktop": (
+            "Claude Desktop persistent app state (runtime artifacts excluded)",
+            (
+                SourceSpec(
+                    "app-state",
+                    home / "Library" / "Application Support" / "Claude",
+                    "tree",
+                    ("vm_bundles", "Cache", "GPUCache", "Code Cache"),
+                ),
+            ),
+        ),
+    }
+
+
+def find_backup_root(explicit: str | None) -> Path | None:
+    if explicit:
+        return Path(explicit).expanduser()
+    env = os.environ.get("SESSION_BACKUP_DEST")
+    if env:
+        return Path(env).expanduser()
+    config = home_dir() / ".config" / "mac-optimize" / "session-backup.conf"
+    if config.is_file():
+        for line in config.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("SESSION_BACKUP_DEST="):
+                return Path(line.split("=", 1)[1].strip().strip('"').strip("'")).expanduser()
+    volumes = Path("/Volumes")
+    if volumes.is_dir():
+        for volume in sorted(volumes.iterdir()):
+            candidate = volume / "mac-optimize-backups"
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def require_backup_root(explicit: str | None) -> Path:
+    root = find_backup_root(explicit)
+    if root is None or not (root.exists() or root.parent.is_dir()):
+        raise SystemExit(
+            "No backup drive available. Mount the external drive (with a "
+            "mac-optimize-backups folder), pass --dest, or set "
+            "$SESSION_BACKUP_DEST."
+        )
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    return root
+
+
+def profile_dest(root: Path, name: str) -> Path:
+    dest = root / BACKUP_DIRNAME / name
+    dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        dest.chmod(0o700)
+    except OSError:
+        pass
+    return dest
+
+
+def _regular_files(root: Path, excludes: tuple[str, ...] = ()) -> list[Path]:
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(root)
+        if rel.parts and rel.parts[0] in excludes:
+            continue
+        out.append(path)
+    return sorted(out, key=lambda p: str(p.relative_to(root)))
+
+
+def _nested_sidecar(path: Path, root: Path) -> bool:
+    parent = path.parent
+    while parent != root:
+        if (parent.parent / f"{parent.name}.jsonl").is_file():
+            return True
+        parent = parent.parent
+    return False
+
+
+def discover_units(spec: SourceSpec) -> list[Unit]:
+    root = spec.root
+    if not root.is_dir():
+        return []
+    if spec.mode == "tree":
+        files = [(p, Path(spec.label) / p.relative_to(root)) for p in _regular_files(root, spec.excludes)]
+        return [Unit(spec.label or ".", False, files)] if files else []
+
+    units: list[Unit] = []
+    for parent in sorted(root.rglob("*.jsonl"), key=str):
+        if not parent.is_file() or parent.is_symlink() or _nested_sidecar(parent, root):
+            continue
+        rel = parent.relative_to(root)
+        files = [(parent, Path(spec.label) / rel)]
+        sidecar = parent.with_suffix("")
+        if spec.mode == "coupled" and sidecar.is_dir():
+            for child in _regular_files(sidecar):
+                files.append((child, Path(spec.label) / child.relative_to(root)))
+        units.append(Unit(str(Path(spec.label) / rel), spec.mode == "coupled", files))
+    return units
+
+
+def discover_profile(name: str) -> list[Unit]:
+    specs = profile_specs()
+    if name not in specs:
+        raise SystemExit(f"Unknown profile: {name}")
+    units: list[Unit] = []
+    for source in specs[name][1]:
+        units.extend(discover_units(source))
+    return units
+
+
+def all_profiles() -> list[str]:
+    return list(profile_specs())
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_atomic(source: Path, destination: Path) -> None:
+    before = source.stat()
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    os.close(fd)
+    temp_path = Path(temporary)
+    try:
+        with source.open("rb") as src, temp_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        after = source.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise RuntimeError(f"source changed during copy: {source}")
+        os.chmod(temp_path, 0o600)
+        shutil.copystat(source, temp_path, follow_symlinks=False)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, destination)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _manifest(profile: str, destination: Path, units: list[Unit]) -> dict:
+    entries: list[dict] = []
+    unit_records: list[dict] = []
+    for unit in units:
+        unit_entries: list[str] = []
+        for source, rel in unit.files:
+            target = destination / rel
+            if not target.is_file():
+                continue
+            stat = target.stat()
+            rel_text = str(rel)
+            entries.append({
+                "path": rel_text,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": sha256(target),
+                "unit": unit.key,
+            })
+            unit_entries.append(rel_text)
+        if unit_entries:
+            unit_records.append({"id": unit.key, "coupled": unit.coupled, "entries": unit_entries})
+    return {
+        "schema": 1,
+        "profile": profile,
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "entries": entries,
+        "units": unit_records,
+    }
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def backup_profile(name: str, root: Path, dry_run: bool = False) -> tuple[int, int]:
+    units = discover_profile(name)
+    destination = profile_dest(root, name) if not dry_run else root / BACKUP_DIRNAME / name
+    copied = 0
+    errors = 0
+    for unit in units:
+        for source, rel in unit.files:
+            target = destination / rel
+            if dry_run:
+                print(f"would copy {name}/{rel}")
+                copied += 1
+                continue
+            try:
+                _copy_atomic(source, target)
+                copied += 1
+            except (OSError, RuntimeError) as error:
+                print(f"error: {error}", file=sys.stderr)
+                errors += 1
+    if not dry_run and errors == 0:
+        _write_json_atomic(destination / "manifest.json", _manifest(name, destination, units))
+    return copied, errors
+
+
+def _source_for_entry(profile: str, rel: Path) -> Path | None:
+    for source in profile_specs()[profile][1]:
+        label = Path(source.label)
+        try:
+            source_rel = rel.relative_to(label) if source.label else rel
+        except ValueError:
+            continue
+        candidate = source.root / source_rel
+        if source.mode == "tree" and source_rel.parts and source_rel.parts[0] in source.excludes:
+            return None
+        return candidate
+    return None
+
+
+def verify_profile(name: str, root: Path) -> tuple[int, int, int]:
+    destination = root / BACKUP_DIRNAME / name
+    manifest_path = destination / "manifest.json"
+    if not manifest_path.is_file():
+        print(f"{name}: no manifest")
+        return 0, 0, 1
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        print(f"{name}: invalid manifest: {error}")
+        return 0, 0, 1
+    ok = 0
+    missing = 0
+    drift = 0
+    for entry in manifest.get("entries", []):
+        rel = Path(entry["path"])
+        destination_file = destination / rel
+        source_file = _source_for_entry(name, rel)
+        if not destination_file.is_file() or source_file is None or not source_file.is_file():
+            missing += 1
+            continue
+        try:
+            dest_hash = sha256(destination_file)
+            source_hash = sha256(source_file)
+        except OSError:
+            missing += 1
+            continue
+        if dest_hash != entry.get("sha256") or source_hash != entry.get("sha256"):
+            drift += 1
+        else:
+            ok += 1
+    print(f"{name}: {ok} verified, {drift} drifted, {missing} missing")
+    return ok, drift, missing
+
+
+def cmd_profiles(args: argparse.Namespace) -> int:
+    for name, (description, sources) in profile_specs().items():
+        roots = ", ".join(str(source.root) for source in sources)
+        print(f"{name}\t{description}\t{roots}")
+    return 0
+
+
+def selected_profiles(value: str) -> list[str]:
+    names = all_profiles() if value == "all" else [value]
+    unknown = [name for name in names if name not in profile_specs()]
+    if unknown:
+        raise SystemExit(f"Unknown profile: {unknown[0]}")
+    return names
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    root = require_backup_root(args.dest)
+    total = 0
+    errors = 0
+    for name in selected_profiles(args.profile):
+        copied, failed = backup_profile(name, root, args.dry_run)
+        total += copied
+        errors += failed
+        if not args.quiet:
+            action = "would copy" if args.dry_run else "copied"
+            print(f"{name}: {action} {copied} files")
+    if not args.dry_run and errors == 0 and not args.quiet:
+        print(f"backup complete: {total} files")
+    return 1 if errors else 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    root = require_backup_root(args.dest)
+    failed = 0
+    for name in selected_profiles(args.profile):
+        _, drift, missing = verify_profile(name, root)
+        failed += drift + missing
+    return 1 if failed else 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    root = require_backup_root(args.dest)
+    for name in selected_profiles(args.profile):
+        units = discover_profile(name)
+        entries = sum(len(unit.files) for unit in units)
+        size = sum(path.stat().st_size for unit in units for path, _ in unit.files if path.is_file())
+        manifest = root / BACKUP_DIRNAME / name / "manifest.json"
+        state = "backed up" if manifest.is_file() else "not backed up"
+        print(f"{name}: {entries} source files, {size} bytes, {state}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="On-demand backups for agent session history")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dest", help="mac-optimize-backups directory")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    profiles = sub.add_parser("profiles", help="list available backup profiles")
+    profiles.set_defaults(func=cmd_profiles)
+
+    backup = sub.add_parser("backup", parents=[common], help="copy profile data to the external drive")
+    backup.add_argument("profile", choices=[*all_profiles(), "all"])
+    backup.add_argument("--dry-run", action="store_true")
+    backup.add_argument("--quiet", action="store_true")
+    backup.set_defaults(func=cmd_backup)
+
+    verify = sub.add_parser("verify", parents=[common], help="hash-check backup and current source data")
+    verify.add_argument("profile", choices=[*all_profiles(), "all"])
+    verify.set_defaults(func=cmd_verify)
+
+    status = sub.add_parser("status", parents=[common], help="show source and manifest status")
+    status.add_argument("profile", choices=[*all_profiles(), "all"])
+    status.set_defaults(func=cmd_status)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

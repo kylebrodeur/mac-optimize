@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Guided Safe Mode benchmark workflow for macOS.
+
+Apple Silicon does not expose a supported user-space switch for one-time Safe
+Mode boot. This command captures evidence, persists it across a reboot, guides
+the user through Apple's Startup Options flow, and compares before/Safe
+Mode/normal measurements. It never changes boot policy and never kills apps.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+
+def home_dir() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+
+
+def state_dir() -> Path:
+    configured = os.environ.get("MAC_SAFEMODE_STATE_DIR")
+    return Path(configured).expanduser() if configured else home_dir() / "Library" / "Application Support" / "mac-optimize" / "safemode"
+
+
+def report_dir() -> Path:
+    configured = os.environ.get("MAC_SAFEMODE_REPORT_DIR")
+    return Path(configured).expanduser() if configured else state_dir() / "reports"
+
+
+def data_root() -> str:
+    return os.environ.get("MAC_SAFEMODE_DATA_ROOT", "/System/Volumes/Data")
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def timestamp() -> str:
+    return utc_now().strftime("%Y%m%dT%H%M%SZ")
+
+
+def iso_now() -> str:
+    return utc_now().isoformat(timespec="seconds")
+
+
+def private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    private_dir(path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def run_command(command: list[str], timeout: int = 45) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+        return {
+            "command": command,
+            "exit_code": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"command": command, "exit_code": None, "stdout": "", "stderr": str(error)}
+
+
+def combined_output(result: dict[str, Any]) -> str:
+    return f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+
+
+def detect_boot_mode() -> tuple[str, dict[str, Any]]:
+    result = run_command(["system_profiler", "SPSoftwareDataType"])
+    match = re.search(r"Boot Mode:\s*([^\s]+)", combined_output(result), re.IGNORECASE)
+    return (match.group(1) if match else "Unknown"), result
+
+
+def process_role(command: str) -> str | None:
+    value = command.lower()
+    if re.search(r"(?:^|/)(?:omp|omp-rpc-cli)(?:$|[ /])", value):
+        return "OMP"
+    if re.search(r"(?:^|/)(?:codex|codex-code-mode-host)(?:$|[ /])", value) or "codex framework" in value:
+        return "Codex"
+    if "/claude.app/" in value or re.search(r"(?:^|/)(?:claude|claude-code)(?:$|[ /])", value):
+        return "Claude"
+    if "/visual studio code.app/" in value or "/code - insiders.app/" in value:
+        return "VS Code"
+    if re.search(r"(?:^|/)(?:vite|node|nodejs)(?:$|[ /])", value):
+        return "Vite/node"
+    if "/webkit." in value or "/google chrome.app/" in value or "/safari.app/" in value or "/firefox.app/" in value:
+        return "Browser"
+    if "/obsidian.app/" in value:
+        return "Obsidian"
+    if "copilot" in value and ("/.vscode/" in value or "/code/" in value):
+        return "Copilot"
+    if "/tabby.app/" in value or re.search(r"(?:^|/)terminal(?:$|[ /])", value):
+        return "Terminal"
+    return None
+
+
+def active_processes() -> dict[str, Any]:
+    # BSD ps truncates `comm=` when it is requested together with `args=`.
+    # Query the columns separately so persisted command names and summaries
+    # retain the real executable path.
+    comm_result = run_command(["ps", "-axo", "pid=,comm="])
+    args_result = run_command(["ps", "-axwwo", "pid=,args="])
+    args_by_pid: dict[str, str] = {}
+    for line in args_result.get("stdout", "").splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2:
+            args_by_pid[fields[0]] = fields[1]
+
+    entries: list[dict[str, Any]] = []
+    for line in comm_result.get("stdout", "").splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2:
+            continue
+        pid, command = fields
+        args = args_by_pid.get(pid, "")
+        role = process_role(f"{command} {args}" if args else command)
+        if role is None:
+            continue
+        entry: dict[str, Any] = {"pid": pid, "command": command, "role": role}
+        if args:
+            entry["args"] = args
+        entries.append(entry)
+    return {"command": comm_result, "matching": entries}
+
+
+def home_root_sizes() -> dict[str, Any]:
+    if os.environ.get("MAC_SAFEMODE_SKIP_DU"):
+        return {"skipped": True, "reason": "MAC_SAFEMODE_SKIP_DU is set", "entries": []}
+    result = run_command(["du", "-x", "-k", "-d", "1", str(home_dir())], timeout=180)
+    entries: list[dict[str, Any]] = []
+    root = str(home_dir())
+    for line in result.get("stdout", "").splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or fields[1] == root:
+            continue
+        try:
+            size_kib = int(fields[0])
+        except ValueError:
+            continue
+        entries.append({"path": fields[1], "size_kib": size_kib})
+    entries.sort(key=lambda item: item["size_kib"], reverse=True)
+    return {"skipped": False, "command": result, "entries": entries[:20]}
+
+
+def capture_benchmark() -> dict[str, Any]:
+    boot_mode, boot_result = detect_boot_mode()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "captured_at": iso_now(),
+        "boot_mode": boot_mode,
+        "boot_mode_probe": boot_result,
+        "data_root": data_root(),
+        "disk": run_command(["df", "-k", data_root()]),
+        "apfs": run_command(["diskutil", "apfs", "list"], timeout=90),
+        "data_snapshots": run_command(["diskutil", "apfs", "listSnapshots", data_root()], timeout=45),
+        "memory_pressure": run_command(["memory_pressure", "-Q"]),
+        "swap": run_command(["sysctl", "-n", "vm.swapusage"]),
+        "processes": active_processes(),
+        "home_roots": home_root_sizes(),
+    }
+
+
+def active_path() -> Path:
+    return state_dir() / "active-run.json"
+
+
+def load_active() -> dict[str, Any]:
+    path = active_path()
+    if not path.is_file():
+        raise SystemExit("No active Safe Mode run. Start with: mac-safemode prepare")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"Cannot read active Safe Mode run: {error}") from error
+
+
+def write_active(value: dict[str, Any]) -> None:
+    atomic_json(active_path(), value)
+
+
+def run_directory(active: dict[str, Any]) -> Path:
+    return Path(active["run_dir"])
+
+
+def safe_mode_instructions() -> str:
+    return """Safe Mode is not set by changing NVRAM or boot policy on Apple silicon.
+
+Do this now:
+  1. Shut down the Mac.
+  2. Hold the power button until Loading startup options appears.
+  3. Select Macintosh HD.
+  4. Hold Shift and click Continue in Safe Mode.
+  5. Log in, then run: mac-safemode finish
+
+The run state is persisted outside /tmp and will survive the restart."""
+
+
+def prepare(args: argparse.Namespace) -> int:
+    if active_path().exists():
+        raise SystemExit("An active Safe Mode run already exists; finish it before preparing another")
+    run_id = f"{timestamp()}-{uuid.uuid4().hex[:8]}"
+    directory = state_dir() / run_id
+    private_dir(directory)
+    private_dir(report_dir())
+    before = capture_benchmark()
+    atomic_json(directory / "before.json", before)
+    active = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "phase": "prepared",
+        "created_at": iso_now(),
+        "run_dir": str(directory),
+    }
+    write_active(active)
+    matches = before["processes"]["matching"]
+    print(f"Safe Mode benchmark prepared: {directory / 'before.json'}")
+    if matches:
+        counts: dict[str, int] = {}
+        for entry in matches:
+            counts[entry["role"]] = counts.get(entry["role"], 0) + 1
+        print("Close monitored processes before restarting (nothing was killed):")
+        print("  " + ", ".join(f"{role}={count}" for role, count in sorted(counts.items())))
+        for entry in matches[:12]:
+            print(f"  PID {entry['pid']:<7} {entry['role']}: {Path(entry['command']).name}")
+        if len(matches) > 12:
+            print(f"  ... and {len(matches) - 12} more monitored processes")
+    else:
+        print("No monitored agent or development processes detected.")
+    print(safe_mode_instructions())
+    if args.reboot:
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise SystemExit("--reboot requires an interactive confirmation or --yes")
+            answer = input("Type REBOOT to restart now: ").strip()
+            if answer != "REBOOT":
+                print("Restart cancelled; the baseline remains saved.")
+                return 0
+        result = run_command(["osascript", "-e", 'tell application "System Events" to restart'], timeout=20)
+        if result["exit_code"] != 0:
+            raise SystemExit(f"Could not request restart: {result['stderr'] or result['stdout']}")
+        print("Restart requested. Boot into Safe Mode, then run mac-safemode finish.")
+    return 0
+
+
+def parse_df(result: dict[str, Any]) -> dict[str, Any] | None:
+    rows = [line.split() for line in result.get("stdout", "").splitlines() if line.strip()]
+    if len(rows) < 2:
+        return None
+    fields = rows[-1]
+    if len(fields) < 5:
+        return None
+    try:
+        return {"filesystem": fields[0], "total_kib": int(fields[1]), "used_kib": int(fields[2]), "available_kib": int(fields[3]), "capacity": fields[4]}
+    except ValueError:
+        return None
+
+
+def parse_memory_free(benchmark: dict[str, Any]) -> str:
+    match = re.search(r"free percentage:\s*([0-9]+%)", combined_output(benchmark["memory_pressure"]), re.IGNORECASE)
+    return match.group(1) if match else "unknown"
+
+
+def parse_swap_used(benchmark: dict[str, Any]) -> str:
+    match = re.search(r"used\s*=\s*([0-9.]+[A-Za-z]+)", combined_output(benchmark["swap"]), re.IGNORECASE)
+    return match.group(1) if match else "unknown"
+
+
+def phase_row(label: str, benchmark: dict[str, Any]) -> str:
+    disk = parse_df(benchmark["disk"])
+    free = f"{disk['available_kib'] / 1048576:.1f} GiB" if disk else "unknown"
+    blockers = len(benchmark["processes"]["matching"])
+    return f"| {label} | {benchmark.get('boot_mode', 'unknown')} | {free} | {parse_memory_free(benchmark)} | {parse_swap_used(benchmark)} | {blockers} |"
+
+
+def write_report(active: dict[str, Any], before: dict[str, Any], safe: dict[str, Any], normal: dict[str, Any]) -> Path:
+    directory = run_directory(active)
+    report = report_dir() / f"{active['run_id']}.md"
+    text = "\n".join(
+        [
+            "# Safe Mode benchmark",
+            "",
+            f"Run: `{active['run_id']}`",
+            f"Completed: `{iso_now()}`",
+            "",
+            "## Before → Safe Mode → Normal",
+            "",
+            "| Phase | Boot mode | Data free | Memory free | Swap used | Monitored processes |",
+            "| --- | --- | ---: | ---: | ---: | ---: |",
+            phase_row("Before", before),
+            phase_row("Safe Mode", safe),
+            phase_row("Normal", normal),
+            "",
+            "## Artifacts",
+            "",
+            f"- Before: `{directory / 'before.json'}`",
+            f"- Safe Mode: `{directory / 'safe-mode.json'}`",
+            f"- Normal: `{directory / 'normal.json'}`",
+            "- Raw command output is retained in the private JSON artifacts.",
+            "",
+            "## Interpretation",
+            "",
+            "- Safe Mode clears selected system caches and performs a basic startup-disk check.",
+            "- This workflow does not modify boot policy or delete Preboot contents.",
+            "- Compare APFS allocation, Data free space, swap, and process counts before deciding on further action.",
+            "",
+        ]
+    )
+    report.write_text(text, encoding="utf-8")
+    report.chmod(0o600)
+    return report
+
+
+def finish() -> int:
+    active = load_active()
+    directory = run_directory(active)
+    phase = active.get("phase")
+    before_path = directory / "before.json"
+    before = json.loads(before_path.read_text(encoding="utf-8"))
+    current = capture_benchmark()
+    mode = current.get("boot_mode", "Unknown").lower()
+    if phase == "prepared":
+        if mode != "safe":
+            raise SystemExit(f"No Safe Mode boot detected (reported {current.get('boot_mode', 'Unknown')}); run this command after selecting Continue in Safe Mode")
+        atomic_json(directory / "safe-mode.json", current)
+        active["phase"] = "safe-captured"
+        active["safe_captured_at"] = iso_now()
+        write_active(active)
+        print(f"Safe Mode benchmark saved: {directory / 'safe-mode.json'}")
+        print("Restart normally, then run: mac-safemode finish")
+        return 0
+    if phase == "safe-captured":
+        if mode == "safe":
+            raise SystemExit("Safe Mode benchmark already captured; restart normally before finishing")
+        safe = json.loads((directory / "safe-mode.json").read_text(encoding="utf-8"))
+        atomic_json(directory / "normal.json", current)
+        report = write_report(active, before, safe, current)
+        active["phase"] = "completed"
+        active["completed_at"] = iso_now()
+        active["report"] = str(report)
+        atomic_json(directory / "completed.json", active)
+        active_path().unlink()
+        print(f"Safe Mode comparison report saved: {report}")
+        return 0
+    raise SystemExit(f"Unsupported Safe Mode run phase: {phase}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Capture and compare macOS benchmarks across a guided Safe Mode reboot")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare", help="capture baseline and guide the Safe Mode reboot")
+    prepare_parser.add_argument("--reboot", action="store_true", help="request a restart after confirmation")
+    prepare_parser.add_argument("--yes", action="store_true", help="skip the --reboot confirmation")
+    subparsers.add_parser("finish", help="capture Safe Mode or normal results and complete the comparison")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "prepare":
+        return prepare(args)
+    return finish()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit("interrupted")

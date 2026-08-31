@@ -1,4 +1,4 @@
-.PHONY: install uninstall install-skills doctor report audit reclaim backup sessions test lint vendor-lib
+.PHONY: install uninstall install-skills doctor report audit reclaim backup sessions session-backup session-status session-verify safemode test lint vendor-lib
 
 install:
 	./install.sh
@@ -37,6 +37,19 @@ backup:
 # Age-bucketed inventory of Codex sessions + their backup status.
 sessions:
 	bin/codex-backup index
+
+# On-demand profile backups for Pi, OMP, Claude Code, and Claude Desktop.
+session-backup:
+	bin/session-backup backup all
+
+session-status:
+	bin/session-backup status all
+
+session-verify:
+	bin/session-backup verify all
+
+safemode:
+	bin/mac-safemode prepare
 
 # Run the self-contained regression harnesses.
 test:

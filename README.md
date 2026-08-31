@@ -36,7 +36,9 @@ make doctor           # verify the install (tools + launchd, and skills if prese
 diskreport            # see where your disk went (read-only)
 mac-reclaim           # reclaim safe caches now
 worktree-audit        # find stray git worktrees
-```
+mac-safemode prepare  # capture before-state and guide one Safe Mode boot
+session-backup backup all  # on-demand Pi/OMP/Claude backups (external drive)
+session-backup status all  # show source and manifest status
 
 `~/.local/bin` must be on your `PATH`. Re-running `make install` is safe.
 
@@ -48,8 +50,10 @@ worktree-audit        # find stray git worktrees
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only with *evidence* they're unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and never removed until an archive-first backup and explicit verified prune workflow exists. |
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
+| **`session-backup`** | On-demand, copy-only backups for Pi (`~/.pi/agent/sessions`), OMP (`~/.omp/agent/sessions` with parent/sidecar units), Claude Code (`~/.claude/projects` plus `file-history`), and Claude Desktop persistent state. It writes private, hash-verified manifests under `mac-optimize-backups/session-backups/<profile>/`, excludes Claude Desktop VM bundles and caches, and never schedules or prunes anything. Use `profiles`, `backup <profile|all>`, `status <profile|all>`, and `verify <profile|all>`. |
 | **`memguard`** | The memory analog of `diskguard` (the real `earlyoom` port). A launchd watcher at login + every 5 min: it reads the kernel's own memory-pressure level (`kern.memorystatus_vm_pressure_level`) and free-RAM %, and at the warn/critical thresholds posts a non-blocking notification **naming the largest RAM consumer** so you can act before jetsam picks the victim. **Never kills a process or deletes app state.** In the disk↔swap coupling quadrant (RAM tight *and* disk too low for swap to grow — the state that force-panicked one of these machines via a `watchdogd` timeout) it now also auto-triggers `mac-reclaim`'s SAFE tier immediately (same rebuildable-cache-only tier `diskguard` already runs on its own schedule, just sooner) and nags every cycle instead of every 30 min until the coupling clears. |
 | **`codex-backup`** | Backs up, indexes, prunes, and restores `~/.codex/sessions` — the large single-copy JSONL logs Codex writes per run (10 GB+ is normal). `backup` rsyncs them to an external drive **cumulatively** (never `--delete`), so a later prune frees local space while the backup keeps everything. `index` inventories every session by age bucket (45+/30-45/15-30/<15 days idle), size, project (`cwd`), and backup status. `prune --older-than N` deletes local sessions idle ≥ N days **only when verified present in the backup** — dry-run by default, keeps the N newest, and never touches anything not backed up. `restore` copies sessions back by date/uuid/project/all and never clobbers a newer local file. `verify` reports drift. Resolves the drive from `--dest`, `$CODEX_BACKUP_DEST`, `~/.config/mac-optimize/codex-backup.conf`, or the first mounted volume with a `mac-optimize-backups/` folder; a weekly launchd agent runs `backup --quiet` and no-ops when the drive is absent. |
+| **`mac-safemode`** | Guided, evidence-first Safe Mode benchmark for macOS. `prepare` captures disk, APFS, memory, swap, monitored-process, and home-root state, persists it outside `/tmp`, and prints Apple's supported Apple silicon Startup Options steps. After the user boots Safe Mode, `finish` captures the Safe Mode state; after a normal reboot, a second `finish` writes a Markdown before/Safe Mode/normal comparison report. It never changes NVRAM or boot policy, kills processes, deletes data, or reboots without explicit `--reboot` confirmation. |
 | **`diskhealth`** | Read-only SMART + filesystem health for the SSDs in the Mac. Wraps `smartctl` (smartmontools) to report overall health, temperature, available spare, wear (percentage used), media errors, and — the one that catches external drives — the **power-cycle/unsafe-shutdown pattern** (a drive power-cycling ~10×/hour or with hundreds of unsafe shutdowns is being yanked from power, not failing). `--verify` adds a read-only `diskutil verifyVolume` on mounted volumes. Requires `brew install smartmontools`. |
 | **`mac-optimize-doctor`** | Read-only health check (`make doctor`): confirms the tools are on PATH and the launchd agents are loaded + valid, and points you at `npx skills list` for an agent-agnostic skills check. Never downloads or executes remote code. Exits non-zero on any failure. |
 
@@ -68,7 +72,9 @@ Four principles, in order of trust:
 
 | Command | Effect |
 |---------|--------|
-| `diskreport` | Read-only disk report. |
+| `mac-safemode prepare` | Capture a baseline and print the supported Apple silicon Safe Mode steps; no reboot is requested. |
+| `mac-safemode prepare --reboot` | After explicit confirmation (`REBOOT`, or `--yes`), request a restart; the user still selects Safe Mode in Startup Options. |
+| `mac-safemode finish` | Capture the current boot phase; run once in Safe Mode, then once after a normal restart to save the comparison report. |
 | `diskreport --scan [PATH]` | + one-shot `dust` walk of PATH (default `$HOME`) for big single files/dirs the fixed buckets miss. Requires `dust`. |
 | `mac-reclaim` | Reclaim safe caches (unattended-safe). |
 | `mac-reclaim --deep --dry-run` | Preview deep prune — deletes nothing, prints each candidate + why it's unused. |
@@ -135,23 +141,29 @@ These solve adjacent problems well; this repo defers to them rather than shippin
 | [`wsl-optimize`](https://github.com/kylebrodeur/wsl-optimize) | The WSL2 sibling. On WSL the silent killer is memory (the OOM killer reaps session plumbing while protecting the hogs) *plus* a virtual disk that only grows. Shares `worktree-audit` and `lib/common.sh` with this repo. |
 | [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) | The shared bash primitives both repos vendor: platform detection, deletion guards, and the safe-tier cache reclaim. Refresh with `make vendor-lib`. |
 | [`agent-session-kill`](https://github.com/kylebrodeur/agent-session-kill) | Agent transcript cleanup done properly: trash-first deletion, protection lists for auth/settings/skills/memory, and coverage of Pi/OMP/Copilot Chat. `mac-reclaim --deep` **delegates `~/.claude/projects` to it when installed** and only falls back to its own pruning otherwise. |
-
 ## Requirements
 
-macOS (Apple Silicon or Intel). The suite is **bash-first with zero runtime dependencies**; the safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Two tools — `codex-backup` and `vscode-chat-backup` — are **Python 3** (standard library only, already on macOS). `codex-backup` uses `rsync` and prefers Homebrew's `rsync` 3.x when present, falling back to the system `openrsync`. Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
+macOS (Apple Silicon or Intel). The suite is **bash-first with zero runtime dependencies**; the safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Three tools — `codex-backup`, `session-backup`, and `vscode-chat-backup` — are **Python 3** (standard library only, already on macOS). `codex-backup` uses `rsync` and prefers Homebrew's `rsync` 3.x when present, falling back to the system `openrsync`; `session-backup` uses atomic standard-library copies and SHA-256 manifests. Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
+
+`mac-safemode` also uses only Python 3 standard-library modules. It is a guided diagnostic: it records evidence and prints the supported Startup Options flow, but never changes boot policy or performs cleanup.
 
 ## Automation & uninstall
 
-`make install` also installs four launchd agents:
+`make install` installs the tools and the four existing launchd agents. `session-backup` is intentionally **not** a launchd service: run it only when requested.
+
+- `session-backup backup all` — copy all available profiles
+- `session-backup status all` — show source counts and manifest presence
+- `session-backup verify all` — hash-check local sources against the external copies
+
+The plists are templates; `install.sh` fills in `$HOME` and a cross-arch `PATH` at install time, so nothing is hardcoded to one machine.
 
 - `com.mac-optimize.diskguard` — at login + every 3 h
 - `com.mac-optimize.memguard` — at login + every 5 min
 - `com.mac-optimize.mac-reclaim` — weekly, Sundays 11:00 (daytime, so the laptop is awake)
 - `com.mac-optimize.codex-backup` — weekly, Sundays 11:30 (`codex-backup backup --quiet`; no-ops when the external drive isn't mounted, never deletes)
 
-The plists are templates; `install.sh` fills in `$HOME` and a cross-arch `PATH` at install time, so nothing is hardcoded to one machine.
-
 **Notification permission (one-time):** the first low-disk or low-memory banner may require allowing notifications for the invoking process (osascript / Script Editor) under **System Settings → Notifications**. No blocking dialogs are ever used, so a missed banner is cosmetic — the guard still runs and logs to `~/Library/Logs/diskguard.log` / `~/Library/Logs/memguard.log`.
+
 
 ```bash
 make uninstall      # unloads agents, removes deployed scripts; repo left intact
