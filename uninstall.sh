@@ -11,7 +11,7 @@ for label in com.mac-optimize.diskguard com.mac-optimize.memguard com.mac-optimi
   echo "removed agent  $label"
 done
 
-for s in mac-reclaim diskreport worktree-audit diskguard memguard mac-optimize-doctor codex-backup session-backup diskhealth vscode-chat-backup mac-safemode; do
+for s in mac-reclaim diskreport worktree-audit workspace-audit diskguard memguard mac-optimize-doctor codex-backup session-backup diskhealth vscode-chat-backup mac-safemode; do
   rm -f "$HOME/.local/bin/$s"
   echo "removed script $HOME/.local/bin/$s"
 done

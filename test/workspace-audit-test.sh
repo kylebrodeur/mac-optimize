@@ -18,7 +18,11 @@ trap 'rm -rf "$SANDBOX"' EXIT
 ok(){ PASS=$((PASS+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
-mkdir -p "$ROOT/clean-repo" "$ROOT/dirty-repo/node_modules/nested-repo" "$REPORT"
+mkdir -p "$ROOT/clean-repo" \
+  "$ROOT/dirty-repo/node_modules/nested-repo/.git" \
+  "$ROOT/dirty-repo/.venv/nested-venv/.git" \
+  "$ROOT/dirty-repo/out/nested-out/.git" \
+  "$REPORT"
 
 init_repo(){
   local repo="$1"
@@ -35,6 +39,7 @@ init_repo "$ROOT/dirty-repo"
 printf 'changed\n' > "$ROOT/dirty-repo/README.txt"
 printf 'untracked\n' > "$ROOT/dirty-repo/notes.txt"
 printf 'dependency\n' > "$ROOT/dirty-repo/node_modules/package.txt"
+printf '.venv/\nout/\n' > "$ROOT/dirty-repo/.git/info/exclude"
 git -C "$ROOT/dirty-repo/node_modules/nested-repo" init -q
 
 cat > "$FAKE_ENGINE" <<'ENGINE'
@@ -83,11 +88,28 @@ assert dirty["untracked"] == 3
 assert dirty["verdict"] == "BACKUP_NOW"
 assert dirty["size_buckets_kb"]["dependencies"] > 0
 assert clean["verdict"] == "COLD_ARCHIVE"
+
 assert engine_log.read_text().strip() == str(root)
 assert "FAKE WORKTREE ENGINE" in report["worktree_engine"]["output"]
 assert "No automatic move/delete/prune" in md_files[0].read_text()
 PY
 if [ "$?" -eq 0 ]; then ok "report model and privacy output"; else no "report model and privacy output"; fi
+mkdir -p "$HOME/.local/bin" "$SANDBOX/fake-bin"
+touch "$HOME/.local/bin/workspace-audit"
+cat > "$SANDBOX/fake-bin/launchctl" <<'LAUNCHCTL'
+#!/usr/bin/env bash
+exit 0
+LAUNCHCTL
+chmod +x "$SANDBOX/fake-bin/launchctl"
+if PATH="$SANDBOX/fake-bin:$PATH" HOME="$HOME" bash "$HERE/../uninstall.sh" >/dev/null; then
+  if [ ! -e "$HOME/.local/bin/workspace-audit" ]; then
+    ok "uninstall removes workspace-audit"
+  else
+    no "uninstall removes workspace-audit"
+  fi
+else
+  no "uninstall script ran in disposable HOME"
+fi
 
 printf '\nworkspace-audit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

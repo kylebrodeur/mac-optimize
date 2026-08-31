@@ -19,14 +19,18 @@ PRUNED_DISCOVERY_DIRS = {
     ".cache",
     ".next",
     ".playwright-mcp",
+    ".pnpm-store",
     ".turbo",
+    ".venv",
     "Library",
     "build",
     "coverage",
     "dist",
     "node_modules",
+    "out",
     "test-results",
     "vendor",
+    "venv",
 }
 DEPENDENCY_DIRS = {"node_modules", ".pnpm-store", ".venv", "venv", "vendor"}
 GENERATED_DIRS = {
@@ -217,6 +221,7 @@ def repository_record(repo: Path) -> dict[str, Any]:
     has_remote_refs = remote_ref_count(repo) > 0
     unpublished = unpublished_count(repo, has_remote_refs)
     buckets = size_buckets(repo)
+    total_size_kb = sum(buckets.values())
     try:
         mtime = dt.datetime.fromtimestamp(repo.stat().st_mtime).astimezone().isoformat()
     except OSError:
@@ -258,7 +263,7 @@ def repository_record(repo: Path) -> dict[str, Any]:
         "unpublished_commits": unpublished,
         "commit_count": commit_count(repo) if has_head else 0,
         "worktree_count": worktree_count(repo),
-        "size_kb": size_kb(repo),
+        "size_kb": total_size_kb,
         "size_buckets_kb": buckets,
         "verdict": verdict,
         "reason": reason,
