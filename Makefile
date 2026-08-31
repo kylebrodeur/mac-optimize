@@ -1,4 +1,4 @@
-.PHONY: install uninstall install-skills doctor report audit reclaim backup sessions session-backup session-status session-verify safemode test lint vendor-lib
+.PHONY: install uninstall install-skills doctor report audit workspace-audit reclaim backup sessions session-backup session-status session-verify safemode test lint vendor-lib
 
 install:
 	./install.sh
@@ -26,6 +26,9 @@ report:
 
 audit:
 	bin/worktree-audit
+
+workspace-audit:
+	bin/workspace-audit --save
 
 reclaim:
 	bin/mac-reclaim

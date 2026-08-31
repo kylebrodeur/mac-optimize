@@ -6,6 +6,13 @@ All notable changes to **mac-optimize** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`workspace-audit`** — read-only full-workspace Git inventory and private
+  Markdown/JSON reports. It records repository state, commit recency, filesystem
+  mtime, linked worktree findings, mounted-volume capacity, and ranked
+  archive/backup recommendations while never moving, deleting, pruning, or
+  changing Git state.
+
 ## [1.2.0] - 2026-08-30
 
 ### Added

@@ -19,6 +19,7 @@ mkdir -p "$BINDIR" "$LADIR"
 
 echo "Installing scripts → $BINDIR"
 for f in "$REPO"/bin/*; do
+  [ -f "$f" ] || continue
   install -m 0755 "$f" "$BINDIR/$(basename "$f")"
   echo "  $(basename "$f")"
 done

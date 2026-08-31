@@ -36,6 +36,7 @@ make doctor           # verify the install (tools + launchd, and skills if prese
 diskreport            # see where your disk went (read-only)
 mac-reclaim           # reclaim safe caches now
 worktree-audit        # find stray git worktrees
+workspace-audit --save  # audit every workspace repo; save private Markdown + JSON reports
 mac-safemode prepare  # capture before-state and guide one Safe Mode boot
 session-backup backup all  # on-demand Pi/OMP/Claude backups (external drive)
 session-backup status all  # show source and manifest status
@@ -49,6 +50,7 @@ session-backup status all  # show source and manifest status
 | **`diskreport`** | Read-only "where did my disk go?" — top consumers in `Application Support`, `Caches`, and dev/agent caches, plus the big "review-tier" state (VS Code `workspaceStorage`, Claude `vm_bundles`, `.claude/projects`) and recent reclaim history. Deletes nothing. `--scan [PATH]` adds a one-shot [`dust`](https://github.com/bootandy/dust) walk of PATH (default `$HOME`) to catch big single files/dirs the fixed buckets don't look inside — opt-in since it walks the whole tree. For open-ended interactive digging, use [`ncdu`](https://dev.yorhel.nl/ncdu) directly (`brew install ncdu dust`) — navigate, sort, delete in place. |
 | **`mac-reclaim`** | Reclaims in two tiers. **Safe tier** (default) clears caches that rebuild on demand (`pnpm store prune`, `uv cache prune`, npm `_cacache`, codex runtimes, `.ShipIt` updaters, stale logs) — safe *by construction*. **`--deep`** prunes idle `vm_bundles`, `local-agent-mode-sessions`, and `.claude/projects` only with *evidence* they're unused, behind `--dry-run`, an allowlist, `lsof` open-file guards, and a keep-newest floor. Orphaned VS Code `workspaceStorage` is reported as REVIEW/protected and never removed until an archive-first backup and explicit verified prune workflow exists. |
 | **`worktree-audit`** | *(shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib) — same copy as `wsl-optimize`)* Finds stray git worktrees and classifies each **SAFE** (clean + every commit reachable from another ref) or **REVIEW** (dirty or has commits that exist nowhere else). `--prune` removes SAFE ones; `--backup` archives REVIEW ones to git bundles so they *become* safe to prune. |
+| **`workspace-audit`** | Read-only full-workspace Git audit: recursively discovers repositories, records branch/commit/upstream/dirty/untracked state plus filesystem mtime, separates rebuildable dependency/generated bulk from source, incorporates linked-worktree safety output, and ranks `BACKUP_NOW`, `SYNC_REVIEW`, and `COLD_ARCHIVE` candidates. `--save` writes private Markdown + JSON reports; it never moves, deletes, prunes, fetches, or changes Git state. |
 | **`diskguard`** | The launchd watcher (an `earlyoom` analog). At login + every 3 h: below 20 GB free it runs the **safe** reclaim and posts a non-blocking notification; below 10 GB it posts an urgent notice pointing at the manual deep tools. Never runs a destructive prune unattended. |
 | **`session-backup`** | On-demand, copy-only backups for Pi (`~/.pi/agent/sessions`), OMP (`~/.omp/agent/sessions` with parent/sidecar units), Claude Code (`~/.claude/projects` plus `file-history`), and Claude Desktop persistent state. It writes private, hash-verified manifests under `mac-optimize-backups/session-backups/<profile>/`, excludes Claude Desktop VM bundles and caches, and never schedules or prunes anything. Use `profiles`, `backup <profile|all>`, `status <profile|all>`, and `verify <profile|all>`. |
 | **`memguard`** | The memory analog of `diskguard` (the real `earlyoom` port). A launchd watcher at login + every 5 min: it reads the kernel's own memory-pressure level (`kern.memorystatus_vm_pressure_level`) and free-RAM %, and at the warn/critical thresholds posts a non-blocking notification **naming the largest RAM consumer** so you can act before jetsam picks the victim. **Never kills a process or deletes app state.** In the disk↔swap coupling quadrant (RAM tight *and* disk too low for swap to grow — the state that force-panicked one of these machines via a `watchdogd` timeout) it now also auto-triggers `mac-reclaim`'s SAFE tier immediately (same rebuildable-cache-only tier `diskguard` already runs on its own schedule, just sooner) and nags every cycle instead of every 30 min until the coupling clears. |
@@ -83,6 +85,7 @@ Four principles, in order of trust:
 | `worktree-audit [ROOT…]` | Audit stray worktrees. Precedence: positional `ROOT…`, else `$WORKTREE_ROOTS`, else common roots (`~/workspace`, `~/projects`, `~/src`, `~/code`). |
 | `worktree-audit --prune` | Remove SAFE worktrees + clear stale registrations. |
 | `worktree-audit --backup [--prune]` | Archive REVIEW worktrees to git bundles, then optionally prune the archived ones. |
+| `workspace-audit [ROOT] --save` | Audit every Git repository under ROOT (default `$WORKSPACE_AUDIT_ROOT` or `~/workspace`) and save private Markdown + JSON reports. Add `--format json` for machine-readable stdout. |
 
 **Environment variables**
 
@@ -99,6 +102,9 @@ Four principles, in order of trust:
 | `RECLAIM_COOLDOWN` | `900` | `memguard` minimum seconds between its own auto-triggered safe reclaims in the coupling quadrant. `0` disables auto-reclaim (notify-only, prior behavior). |
 | `WORKTREE_BACKUP_DIR` | `~/.local/share/worktree-backups` | Where worktree bundles land. |
 | `WORKTREE_ROOTS` | unset | Constrain `worktree-audit` when no positional roots are passed. If set, defaults are not scanned; a nonexistent path yields no repos instead of falling back. |
+| `WORKSPACE_AUDIT_ROOT` | unset | Default root for `workspace-audit` when no positional root is passed. |
+| `WORKSPACE_AUDIT_DIR` | `~/Library/Application Support/mac-optimize/private/audits` | Private directory for saved workspace audit reports. |
+| `WORKTREE_AUDIT_BIN` | auto-detected | Optional path to the read-only linked-worktree audit engine. |
 
 Allowlist paths from deep pruning in `~/.config/mac-reclaim/keep.txt` (one substring per line).
 
@@ -146,6 +152,9 @@ These solve adjacent problems well; this repo defers to them rather than shippin
 macOS (Apple Silicon or Intel). The suite is **bash-first with zero runtime dependencies**; the safe-tier cache reclaim and `worktree-audit` come from [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib), vendored into `lib/` and `bin/` (not a submodule, so the zero-dependency promise holds). Three tools — `codex-backup`, `session-backup`, and `vscode-chat-backup` — are **Python 3** (standard library only, already on macOS). `codex-backup` uses `rsync` and prefers Homebrew's `rsync` 3.x when present, falling back to the system `openrsync`; `session-backup` uses atomic standard-library copies and SHA-256 manifests. Homebrew, `pnpm`, `uv`, `bun`, and `nvm` are all optional: their caches are pruned only if present (each guarded by `command -v`). `ncdu`/`dust` (`brew install ncdu dust`) are optional too — `diskreport --scan` and ad hoc interactive digging degrade to a hint if they're missing.
 
 `mac-safemode` also uses only Python 3 standard-library modules. It is a guided diagnostic: it records evidence and prints the supported Startup Options flow, but never changes boot policy or performs cleanup.
+
+`workspace-audit` also uses only Python 3 standard-library modules (plus Git and
+the macOS `du` utility for repository metadata and size measurements).
 
 ## Automation & uninstall
 

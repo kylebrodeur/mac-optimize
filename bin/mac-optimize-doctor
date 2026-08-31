@@ -12,7 +12,7 @@ hdr(){ printf "\n\033[1m%s\033[0m\n" "$1"; }
 uid="$(id -u)"
 
 hdr "Tools on PATH"
-for t in diskreport mac-reclaim worktree-audit codex-backup session-backup diskhealth diskguard memguard mac-safemode; do
+for t in diskreport mac-reclaim worktree-audit workspace-audit codex-backup session-backup diskhealth diskguard memguard mac-safemode; do
   p="$(command -v "$t" 2>/dev/null)"
   { [ -n "$p" ] && [ -x "$p" ]; } && ok "$t → $p" || no "$t not found on PATH — run 'make install' (and ensure ~/.local/bin is on PATH)"
 done

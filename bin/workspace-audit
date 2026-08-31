@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Audit every Git repository under a workspace root without mutating it."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+PRUNED_DISCOVERY_DIRS = {
+    ".git",
+    ".cache",
+    ".next",
+    ".playwright-mcp",
+    ".turbo",
+    "Library",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "test-results",
+    "vendor",
+}
+DEPENDENCY_DIRS = {"node_modules", ".pnpm-store", ".venv", "venv", "vendor"}
+GENERATED_DIRS = {
+    ".cache",
+    ".next",
+    ".turbo",
+    "build",
+    "coverage",
+    "dist",
+    "out",
+    "test-results",
+}
+AGENT_STATE_DIRS = {
+    ".agents",
+    ".claude",
+    ".codex",
+    ".gemini",
+    ".omp",
+    ".pi",
+    ".superpowers",
+    ".vault-mind",
+    ".vscode",
+}
+BUCKET_NAMES = ("source_or_other", "git", "dependencies", "generated", "agent_state")
+
+
+def run_command(args: list[str], cwd: Path | None = None, timeout: int = 20) -> tuple[str, int, str]:
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "", 1, str(exc)
+    return result.stdout.strip(), result.returncode, result.stderr.strip()
+
+
+def git(repo: Path, *args: str, timeout: int = 20) -> tuple[str, int, str]:
+    return run_command(["git", "-C", str(repo), *args], timeout=timeout)
+
+
+def discover_repositories(root: Path) -> list[Path]:
+    repositories: list[Path] = []
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        has_git = ".git" in files or ".git" in dirs
+        if has_git:
+            repositories.append(current_path)
+            dirs[:] = []
+            continue
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in PRUNED_DISCOVERY_DIRS and not name.startswith(".git")
+        ]
+    return sorted(set(repositories))
+
+
+def size_kb(path: Path) -> int:
+    try:
+        output, code, _ = run_command(["du", "-sk", str(path)], timeout=60)
+        if code == 0 and output:
+            return int(output.split()[0])
+    except (ValueError, OSError):
+        pass
+    return 0
+
+
+def classify_size_child(name: str) -> str:
+    if name == ".git":
+        return "git"
+    if name in DEPENDENCY_DIRS:
+        return "dependencies"
+    if name in GENERATED_DIRS:
+        return "generated"
+    if name in AGENT_STATE_DIRS:
+        return "agent_state"
+    return "source_or_other"
+
+
+def size_buckets(repo: Path) -> dict[str, int]:
+    buckets = {name: 0 for name in BUCKET_NAMES}
+    try:
+        entries = list(os.scandir(repo))
+    except OSError:
+        buckets["source_or_other"] = size_kb(repo)
+        return buckets
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        bucket = classify_size_child(entry.name)
+        buckets[bucket] += size_kb(Path(entry.path))
+    return buckets
+
+
+def status_counts(repo: Path) -> tuple[int, int]:
+    output, code, _ = git(repo, "status", "--porcelain=v1", "-uall")
+    if code != 0:
+        return 0, 0
+    tracked = 0
+    untracked = 0
+    for line in output.splitlines():
+        if not line:
+            continue
+        if line.startswith("?? "):
+            untracked += 1
+        else:
+            tracked += 1
+    return tracked, untracked
+
+
+def worktree_count(repo: Path) -> int:
+    output, code, _ = git(repo, "worktree", "list", "--porcelain")
+    if code != 0:
+        return 0
+    return max(0, sum(1 for line in output.splitlines() if line.startswith("worktree ")) - 1)
+
+
+def remote_ref_count(repo: Path) -> int:
+    output, code, _ = git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes")
+    if code != 0:
+        return 0
+    return len([line for line in output.splitlines() if line])
+
+
+def commit_count(repo: Path) -> int:
+    output, code, _ = git(repo, "rev-list", "--count", "HEAD")
+    if code != 0 or not output:
+        return 0
+    try:
+        return int(output)
+    except ValueError:
+        return 0
+
+
+def unpublished_count(repo: Path, has_remote_refs: bool) -> int:
+    if not has_remote_refs:
+        return 0
+    output, code, _ = git(repo, "rev-list", "--count", "HEAD", "--not", "--remotes")
+    if code != 0 or not output:
+        return 0
+    try:
+        return int(output)
+    except ValueError:
+        return 0
+
+
+def repository_record(repo: Path) -> dict[str, Any]:
+    branch, branch_code, _ = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch_code != 0 or not branch:
+        branch = "(unborn)"
+    elif branch == "HEAD":
+        branch = "(detached)"
+
+    head, head_code, _ = git(repo, "rev-parse", "--short", "HEAD")
+    if head_code != 0:
+        head = ""
+    origin, origin_code, _ = git(repo, "remote", "get-url", "origin")
+    if origin_code != 0:
+        origin = ""
+    upstream, upstream_code, _ = git(
+        repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+    )
+    if upstream_code != 0:
+        upstream = ""
+
+    ahead = 0
+    behind = 0
+    if upstream and head:
+        counts, counts_code, _ = git(repo, "rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+        if counts_code == 0 and counts:
+            try:
+                ahead, behind = (int(value) for value in counts.split()[:2])
+            except (ValueError, TypeError):
+                ahead = behind = 0
+
+    last_commit, commit_code, _ = git(repo, "log", "-1", "--format=%cI")
+    if commit_code != 0:
+        last_commit = ""
+    tracked_changes, untracked = status_counts(repo)
+    has_remote_refs = remote_ref_count(repo) > 0
+    unpublished = unpublished_count(repo, has_remote_refs)
+    buckets = size_buckets(repo)
+    try:
+        mtime = dt.datetime.fromtimestamp(repo.stat().st_mtime).astimezone().isoformat()
+    except OSError:
+        mtime = ""
+
+    has_head = bool(head)
+    dirty = tracked_changes > 0 or untracked > 0
+    if not has_head:
+        verdict = "BACKUP_NOW"
+        reason = "repository has no commit yet; Git cannot reconstruct it"
+    elif dirty or unpublished > 0 or ahead > 0:
+        verdict = "BACKUP_NOW"
+        reason = "local changes or commits are not fully represented by the upstream refs"
+    elif behind > 0:
+        verdict = "SYNC_REVIEW"
+        reason = "local checkout is behind its configured upstream"
+    elif not origin:
+        verdict = "COLD_ARCHIVE"
+        reason = "clean repository has no origin remote"
+    elif upstream:
+        verdict = "HEALTHY"
+        reason = "clean repository is synchronized with its upstream"
+    else:
+        verdict = "COLD_ARCHIVE"
+        reason = "clean repository has no configured upstream branch"
+
+    return {
+        "path": str(repo),
+        "branch": branch,
+        "head": head,
+        "origin": origin,
+        "upstream": upstream,
+        "last_commit": last_commit,
+        "filesystem_mtime": mtime,
+        "tracked_changes": tracked_changes,
+        "untracked": untracked,
+        "ahead": ahead,
+        "behind": behind,
+        "unpublished_commits": unpublished,
+        "commit_count": commit_count(repo) if has_head else 0,
+        "worktree_count": worktree_count(repo),
+        "size_kb": size_kb(repo),
+        "size_buckets_kb": buckets,
+        "verdict": verdict,
+        "reason": reason,
+    }
+
+
+def resolve_worktree_engine() -> str:
+    configured = os.environ.get("WORKTREE_AUDIT_BIN", "")
+    if configured:
+        return configured
+    installed = shutil.which("worktree-audit")
+    if installed:
+        return installed
+    sibling = Path(__file__).with_name("worktree-audit")
+    return str(sibling) if sibling.exists() else ""
+
+
+def run_worktree_engine(root: Path) -> dict[str, Any]:
+    engine = resolve_worktree_engine()
+    if not engine:
+        return {"available": False, "exit_code": None, "command": [], "output": "worktree-audit not found"}
+    output, code, error = run_command([engine, str(root)], timeout=180)
+    combined = output
+    if error:
+        combined = f"{combined}\n{error}" if combined else error
+    return {
+        "available": True,
+        "exit_code": code,
+        "command": [engine, str(root)],
+        "output": combined,
+    }
+
+
+def volume_records() -> list[dict[str, Any]]:
+    volumes = Path("/Volumes")
+    if not volumes.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for entry in sorted(volumes.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            usage = shutil.disk_usage(entry)
+        except OSError:
+            continue
+        backup_roots = [
+            str(entry / name)
+            for name in ("mac-optimize-backups", "workspace-cold", "workspace_backup")
+            if (entry / name).is_dir()
+        ]
+        records.append(
+            {
+                "path": str(entry),
+                "total_bytes": usage.total,
+                "free_bytes": usage.free,
+                "used_bytes": usage.used,
+                "backup_roots": backup_roots,
+            }
+        )
+    return records
+
+
+def format_gib(kb: int) -> str:
+    return f"{kb / 1024 / 1024:.2f} GiB"
+
+
+def format_bytes(value: int) -> str:
+    return f"{value / 1024**3:.1f} GiB"
+
+
+def recommendation_rows(repositories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rank = {"BACKUP_NOW": 0, "SYNC_REVIEW": 1, "COLD_ARCHIVE": 2, "HEALTHY": 3}
+    rows = [repo for repo in repositories if repo["verdict"] != "HEALTHY"]
+    return sorted(rows, key=lambda repo: (rank[repo["verdict"]], -repo["size_kb"], repo["path"]))
+
+
+def markdown_report(report: dict[str, Any]) -> str:
+    summary = report["summary"]
+    lines = [
+        f"# Full workspace Git audit — {report['generated_at']}",
+        "",
+        "Private operator report. This file contains local paths and repository state; do not copy it into the public repository.",
+        "",
+        "## Scope",
+        "",
+        f"- Root: `{report['root']}`",
+        f"- Repositories discovered: **{report['repository_count']}**",
+        "- Git commands ran with `GIT_OPTIONAL_LOCKS=0`.",
+        "- The audit is read-only; it does not fetch, commit, move, delete, prune, reset, or clean.",
+        "",
+        "## Summary",
+        "",
+        f"- `BACKUP_NOW`: {summary['backup_now']}",
+        f"- `SYNC_REVIEW`: {summary['sync_review']}",
+        f"- `COLD_ARCHIVE`: {summary['cold_archive']}",
+        f"- `HEALTHY`: {summary['healthy']}",
+        "",
+        "## Recommended actions",
+        "",
+        "| Priority | Verdict | Repository | Size | Git state | Last commit | Reason |",
+        "|---:|---|---|---:|---|---|---|",
+    ]
+    for index, repo in enumerate(report["recommendations"], start=1):
+        state = []
+        if repo["tracked_changes"]:
+            state.append(f"{repo['tracked_changes']} tracked changes")
+        if repo["untracked"]:
+            state.append(f"{repo['untracked']} untracked")
+        if repo["ahead"]:
+            state.append(f"{repo['ahead']} ahead")
+        if repo["unpublished_commits"]:
+            state.append(f"{repo['unpublished_commits']} unpublished")
+        if repo["behind"]:
+            state.append(f"{repo['behind']} behind")
+        if not state:
+            state.append("clean")
+        lines.append(
+            f"| {index} | `{repo['verdict']}` | `{repo['path']}` | {format_gib(repo['size_kb'])} | "
+            f"{', '.join(state)} | {repo['last_commit'] or 'unborn'} | {repo['reason']} |"
+        )
+    if not report["recommendations"]:
+        lines.append("| — | — | No non-healthy repositories | — | — | — | — |")
+
+    lines.extend(["", "## Storage notes", ""])
+    for repo in report["repositories"]:
+        buckets = repo["size_buckets_kb"]
+        rebuildable = buckets["dependencies"] + buckets["generated"]
+        if rebuildable:
+            lines.append(
+                f"- `{repo['path']}`: {format_gib(rebuildable)} in dependency/build output; "
+                "treat this as rebuildable bulk, not irreplaceable backup data."
+            )
+    if not any(
+        repo["size_buckets_kb"]["dependencies"] + repo["size_buckets_kb"]["generated"]
+        for repo in report["repositories"]
+    ):
+        lines.append("- No dependency or generated buckets were measured.")
+
+    lines.extend(["", "## Linked worktree engine", "", "```text"])
+    engine_output = report["worktree_engine"]["output"] or "(no output)"
+    lines.extend(engine_output.splitlines())
+    lines.extend(["```", ""])
+
+    lines.extend(["## Mounted volumes", ""])
+    if report["volumes"]:
+        lines.extend(["| Volume | Free | Total | Recognized backup roots |", "|---|---:|---:|---|"])
+        for volume in report["volumes"]:
+            roots = ", ".join(f"`{root}`" for root in volume["backup_roots"]) or "—"
+            lines.append(
+                f"| `{volume['path']}` | {format_bytes(volume['free_bytes'])} | "
+                f"{format_bytes(volume['total_bytes'])} | {roots} |"
+            )
+    else:
+        lines.append("No mounted volumes were readable.")
+
+    lines.extend(
+        [
+            "",
+            "## Archive-first suggestion",
+            "",
+            "For REVIEW linked worktrees, archive to Work HD without pruning:",
+            "",
+            "```bash",
+            'GIT_OPTIONAL_LOCKS=0 \\\nWORKTREE_BACKUP_DIR="/Volumes/Work HD/mac-optimize-backups/worktree-backups" \\\n  worktree-audit "$HOME/workspace" --backup',
+            "```",
+            "",
+            "For ordinary repositories, create a Git bundle and capture dirty/untracked state before moving a cold tree to Work HD. Verify the archive first. No automatic move/delete/prune occurred during this audit.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def report_model(root: Path) -> dict[str, Any]:
+    repositories = [repository_record(repo) for repo in discover_repositories(root)]
+    recommendations = recommendation_rows(repositories)
+    summary = {
+        "backup_now": sum(repo["verdict"] == "BACKUP_NOW" for repo in repositories),
+        "sync_review": sum(repo["verdict"] == "SYNC_REVIEW" for repo in repositories),
+        "cold_archive": sum(repo["verdict"] == "COLD_ARCHIVE" for repo in repositories),
+        "healthy": sum(repo["verdict"] == "HEALTHY" for repo in repositories),
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "root": str(root),
+        "repository_count": len(repositories),
+        "summary": summary,
+        "repositories": repositories,
+        "recommendations": recommendations,
+        "volumes": volume_records(),
+        "worktree_engine": run_worktree_engine(root),
+    }
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    default_root = os.environ.get("WORKSPACE_AUDIT_ROOT") or str(Path.home() / "workspace")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", nargs="?", default=default_root, help="workspace root to scan")
+    parser.add_argument("--save", action="store_true", help="write private Markdown and JSON reports")
+    parser.add_argument("--output-dir", help="override the private report directory")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        print(f"workspace-audit: root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    report = report_model(root)
+    markdown = markdown_report(report)
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+
+    if args.save:
+        output_dir = Path(
+            args.output_dir
+            or os.environ.get("WORKSPACE_AUDIT_DIR")
+            or (Path.home() / "Library" / "Application Support" / "mac-optimize" / "private" / "audits")
+        ).expanduser()
+        stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+        stem = f"{stamp}-workspace-git-audit"
+        atomic_write(output_dir / f"{stem}.md", markdown)
+        atomic_write(output_dir / f"{stem}.json", encoded)
+        print(f"Saved private audit reports: {output_dir / stem}.md and {output_dir / stem}.json", file=sys.stderr)
+
+    if args.format == "json":
+        print(encoded, end="")
+    else:
+        print(markdown, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
