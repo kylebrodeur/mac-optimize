@@ -13,6 +13,14 @@ All notable changes to **mac-optimize** are documented here. The format follows
   archive/backup recommendations while never moving, deleting, pruning, or
   changing Git state.
 
+## [1.3.1] - 2026-09-03
+
+### Tests
+- `test/session-backup-test.sh` gains four assertions covering the v1.3.0
+  OMP session-dir resolution: config-file relocation is backed up (default
+  dir skipped) and `OMP_SESSION_DIR` env override is backed up (config dir
+  skipped). 24 passing. Test-only; no tool changes.
+
 ## [1.3.0] - 2026-09-02
 
 ### Added
@@ -132,15 +140,14 @@ All notable changes to **mac-optimize** are documented here. The format follows
   - **`diskguard`** — launchd low-disk watcher: safe reclaim + notify at a
     threshold, never a destructive prune unattended.
   - **`mac-optimize-doctor`** — read-only health check (tools on PATH, launchd
-    agents loaded + valid). Never fetches or executes remote code.
-- Shared `common.sh` vendored from
   [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib);
   transcript cleanup delegated to `agent-session-kill`; `worktree-audit` shared
   with `wsl-optimize`.
 - launchd automation (`diskguard`, weekly `mac-reclaim`) and a `TESTING.md`
   clone-to-uninstall verification guide.
 
-[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/kylebrodeur/mac-optimize/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.0.0...v1.1.0
