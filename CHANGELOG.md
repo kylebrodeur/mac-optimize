@@ -13,6 +13,18 @@ All notable changes to **mac-optimize** are documented here. The format follows
   archive/backup recommendations while never moving, deleting, pruning, or
   changing Git state.
 
+## [1.3.0] - 2026-09-02
+
+### Added
+- **Configurable OMP session store.** `session-backup` and `diskreport` now
+  resolve the OMP session directory the same way `agent-session-kill` v0.3.0
+  does: `$OMP_SESSION_DIR` / `$PI_CODING_AGENT_SESSION_DIR` env, then
+  `~/.config/mac-optimize/omp-session-dir.conf` (`OMP_SESSION_DIR=` line),
+  then the `~/.omp/agent/sessions` default. This keeps backups and reports
+  covering sessions relocated off-home (e.g. to a larger internal volume via
+  an omp wrapper) instead of silently pinning to the default path.
+  `diskreport` labels the configured store wherever it lives.
+
 ## [1.2.0] - 2026-08-30
 
 ### Added
@@ -128,7 +140,8 @@ All notable changes to **mac-optimize** are documented here. The format follows
 - launchd automation (`diskguard`, weekly `mac-reclaim`) and a `TESTING.md`
   clone-to-uninstall verification guide.
 
-[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/kylebrodeur/mac-optimize/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/kylebrodeur/mac-optimize/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/kylebrodeur/mac-optimize/releases/tag/v1.0.0

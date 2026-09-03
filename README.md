@@ -99,7 +99,7 @@ Four principles, in order of trust:
 | `FREE_CRIT_PCT` | `5` | `memguard` posts an urgent (jetsam-imminent) notice at/below this %. |
 | `NOTIFY_COOLDOWN` | `1800` | `memguard` seconds between repeat same-level banners. |
 | `COUPLING_NOTIFY_COOLDOWN` | `300` | `memguard` seconds between repeat banners *while the disk↔swap coupling note is active* — tighter than `NOTIFY_COOLDOWN` on purpose. |
-| `RECLAIM_COOLDOWN` | `900` | `memguard` minimum seconds between its own auto-triggered safe reclaims in the coupling quadrant. `0` disables auto-reclaim (notify-only, prior behavior). |
+| `OMP_SESSION_DIR` | unset | OMP session store override honored by `session-backup`, `diskreport`, and `agent-session-kill` (same precedence: this env var → `~/.config/mac-optimize/omp-session-dir.conf` → `~/.omp/agent/sessions` default). Set it (or the conf file) when an `omp` wrapper relocates session transcripts off-home, e.g. to a larger internal volume. |
 | `WORKTREE_BACKUP_DIR` | `~/.local/share/worktree-backups` | Where worktree bundles land. |
 | `WORKTREE_ROOTS` | unset | Constrain `worktree-audit` when no positional roots are passed. If set, defaults are not scanned; a nonexistent path yields no repos instead of falling back. |
 | `WORKSPACE_AUDIT_ROOT` | unset | Default root for `workspace-audit` when no positional root is passed. |
