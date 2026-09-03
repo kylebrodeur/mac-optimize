@@ -50,6 +50,17 @@ du -sh "$HOME/.npm" "$HOME/Library/pnpm" "$HOME/.cache" "$HOME/.bun" 2>/dev/null
 section "Top hidden dot-dirs — ~/.*  (agent CLIs hoard session logs here)"
 du -sh "$HOME"/.[!.]*/ 2>/dev/null | sort -rh | head -8
 
+# OMP session store may live off-home via ~/.config/mac-optimize/omp-session-dir.conf
+# or $OMP_SESSION_DIR/$PI_CODING_AGENT_SESSION_DIR; show it wherever it is.
+omp_sess="${OMP_SESSION_DIR:-${PI_CODING_AGENT_SESSION_DIR:-}}"
+if [ -z "$omp_sess" ] && [ -f "$HOME/.config/mac-optimize/omp-session-dir.conf" ]; then
+  omp_sess=$(sed -n 's/^OMP_SESSION_DIR=//p' "$HOME/.config/mac-optimize/omp-session-dir.conf" | tail -1 | tr -d '"' | tr -d "'")
+fi
+if [ -n "$omp_sess" ] && [ -d "${omp_sess/#\~/$HOME}" ]; then
+  printf '  %-6s  %s  (configured OMP session store)\n' \
+    "$(du -sh "${omp_sess/#\~/$HOME}" 2>/dev/null | cut -f1)" "${omp_sess/#\~/$HOME}"
+fi
+
 section "REVIEW tier — big, but real state (prune via 'mac-reclaim --deep')"
 for p in \
   "$AS/Code/User/workspaceStorage" \

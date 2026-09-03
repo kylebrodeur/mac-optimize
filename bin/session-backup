@@ -44,6 +44,23 @@ class Unit:
 def home_dir() -> Path:
     return Path(os.environ.get("HOME", str(Path.home()))).expanduser()
 
+def omp_sessions_dir(home: Path) -> Path:
+    """OMP session store, honoring the same resolution omp's wrapper uses:
+    $OMP_SESSION_DIR / $PI_CODING_AGENT_SESSION_DIR env override, then the
+    persisted ~/.config/mac-optimize/omp-session-dir.conf, then the default."""
+    env = os.environ.get("OMP_SESSION_DIR") or os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if env:
+        return Path(env).expanduser()
+    conf = home / ".config" / "mac-optimize" / "omp-session-dir.conf"
+    if conf.is_file():
+        for line in conf.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("OMP_SESSION_DIR="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return Path(value).expanduser()
+    return home / ".omp" / "agent" / "sessions"
+
 
 def profile_specs() -> dict[str, tuple[str, tuple[SourceSpec, ...]]]:
     home = home_dir()
@@ -54,7 +71,7 @@ def profile_specs() -> dict[str, tuple[str, tuple[SourceSpec, ...]]]:
         ),
         "omp": (
             "OMP sessions with coupled sidecars",
-            (SourceSpec("", home / ".omp" / "agent" / "sessions", "coupled"),),
+            (SourceSpec("", omp_sessions_dir(home), "coupled"),),
         ),
         "claude-code": (
             "Claude Code transcripts and file history",
