@@ -90,5 +90,26 @@ rm -rf "$BACKUP_ROOT/dry-run"
 "$TOOL" backup pi --dest "$BACKUP_ROOT/dry-run" --dry-run >/dev/null 2>&1
 check "dry-run does not create manifest" "[ ! -e '$BACKUP_ROOT/dry-run/session-backups/pi/manifest.json' ]"
 
+printf '%s\n' '== configurable OMP session dir =='
+rm -rf "$BACKUP_ROOT/ompcustom"
+CUSTOM_OMP="$SANDBOX/omp-sessions"
+mkdir -p "$CUSTOM_OMP/project"
+printf '{"omp":true}\n' > "$CUSTOM_OMP/project/redirected.jsonl"
+mkdir -p "$HOME/.config/mac-optimize"
+printf 'OMP_SESSION_DIR=%s\n' "$CUSTOM_OMP" > "$HOME/.config/mac-optimize/omp-session-dir.conf"
+rm -rf "$DEST/omp"
+"$TOOL" backup omp --dest "$BACKUP_ROOT/ompcustom" >/dev/null 2>&1
+check "config-file relocation backed up" "[ -f '$BACKUP_ROOT/ompcustom/session-backups/omp/project/redirected.jsonl' ]"
+check "config-file relocation skips default dir" "[ ! -e '$BACKUP_ROOT/ompcustom/session-backups/omp/project/run.jsonl' ]"
+
+printf '%s\n' '== env override =='
+rm -rf "$BACKUP_ROOT/ompenv"
+ENV_OMP="$SANDBOX/omp-env-sessions"
+mkdir -p "$ENV_OMP/project"
+printf '{"omp":true}\n' > "$ENV_OMP/project/envonly.jsonl"
+OMP_SESSION_DIR="$ENV_OMP" "$TOOL" backup omp --dest "$BACKUP_ROOT/ompenv" >/dev/null 2>&1
+check "env override backed up" "[ -f '$BACKUP_ROOT/ompenv/session-backups/omp/project/envonly.jsonl' ]"
+check "env override skips config dir" "[ ! -e '$BACKUP_ROOT/ompenv/session-backups/omp/project/redirected.jsonl' ]"
+
 printf '\nsession-backup: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
