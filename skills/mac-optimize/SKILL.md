@@ -107,12 +107,18 @@ codex-backup backup            # rsync ~/.codex/sessions → external drive
 codex-backup index             # age buckets (45+/30-45/15-30/<15d) + backup status
 ```
 
-Then, and only then, reclaim local space. Prune is dry-run by default and will
-**only** delete sessions it can verify are already in the backup:
+Then, and only then, reclaim local space. Prune is dry-run by default and
+**only** deletes sessions verified present in the backup — and it has three
+hard guards: nothing younger than 30 days is ever a candidate (smaller
+`--older-than` values are clamped), sessions holding a live writer lock are
+kept, and `--apply` is refused outright when stdin is not a terminal —
+launchd, cron, and unattended agent runs fail without deleting anything
+(no override flag). Run `--apply` yourself, at a prompt, after reviewing
+the dry-run:
 
 ```
 codex-backup prune --older-than 30            # dry-run: what would go, grouped by project
-codex-backup prune --older-than 30 --apply    # delete local (backup keeps every copy)
+codex-backup prune --older-than 30 --apply    # delete local — interactive terminal required
 ```
 
 It keeps the N newest (`--keep-recent`, default 5) and never deletes anything

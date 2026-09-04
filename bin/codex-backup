@@ -13,7 +13,10 @@ them, and they pile up fast (10 GB+ is normal), so this tool separates
   index     inventory every session with age buckets (>45 / 30-45 / 15-30 /
             <15 days idle), sizes, project (cwd), and backup status.
   prune     delete LOCAL sessions idle longer than N days — but only ones
-            verified present in the backup. Dry-run by default.
+            verified present in the backup. Dry-run by default, never
+            unattended: an interactive terminal is required to --apply, no
+            session younger than 30 days is ever a candidate, and a session
+            holding a live writer lock is always kept.
   restore   copy sessions back from the backup, by date / uuid / project /
             all. Never clobbers a newer local file without --force.
   verify    compare local vs backup and report drift (missing, size
@@ -29,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +42,14 @@ from pathlib import Path
 SRC = Path.home() / ".codex" / "sessions"
 LOCAL_INDEX = Path.home() / ".codex" / "codex-backup-index.json"
 CONFIG = Path.home() / ".config" / "mac-optimize" / "codex-backup.conf"
+LOCK_DIR = Path.home() / ".codex" / "thread-writer-locks"
+
+# Hard floor: a session idle fewer than this many days is never a prune
+# candidate, no matter what --older-than says.
+MIN_AGE_DAYS = 30
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
 
 # ── colour (only on a tty) ────────────────────────────────────────────────────
 _TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -109,7 +121,7 @@ def require_backup_root(args) -> Path:
 
 # ── session discovery + metadata ───────────────────────────────────────────────
 class Session:
-    __slots__ = ("rel", "path", "size", "mtime", "cwd", "date")
+    __slots__ = ("rel", "path", "size", "mtime", "cwd", "date", "uuid")
 
     def __init__(self, rel: Path, path: Path):
         self.rel = rel
@@ -124,6 +136,11 @@ class Session:
             self.date = f"{parts[0]}-{parts[1]}-{parts[2]}"
         else:
             self.date = datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d")
+        # session uuid: the trailing dash-segment of the rollout filename stem
+        # (last 36 chars = 8-4-4-4-12). Missing/odd names get "" — every other
+        # guard still applies to them.
+        m = _UUID_RE.search(path.stem[-36:])
+        self.uuid = m.group(0) if m else ""
 
     @property
     def idle_days(self) -> int:
@@ -151,6 +168,26 @@ def discover(src: Path = SRC) -> list[Session]:
         if p.is_file():
             out.append(Session(p.relative_to(src), p))
     out.sort(key=lambda s: s.mtime, reverse=True)
+    return out
+
+
+def live_locks() -> set[str]:
+    """UUIDs of sessions that currently hold a writer lock (treated as live).
+
+    Lock files are 0-byte sentinels in ~/.codex/thread-writer-locks named
+    <uuid>.lock. Presence alone marks the session live — over-protection is
+    cheap, under-protection is data loss.
+    """
+    out: set[str] = set()
+    if not LOCK_DIR.is_dir():
+        return out
+    try:
+        entries = list(LOCK_DIR.iterdir())
+    except OSError:
+        return out
+    for p in entries:
+        if p.suffix == ".lock" and _UUID_RE.match(p.stem):
+            out.add(p.stem)
     return out
 
 
@@ -369,14 +406,25 @@ def cmd_prune(args):
     sessions = discover()
     threshold = args.older_than
     keep = args.keep_recent
+    locks = live_locks()
     # keep the N newest overall regardless of age
     protected = {str(s.rel) for s in sessions[:keep]}
 
-    candidates, unsafe = [], []
+    # A requested threshold below the hard floor is clamped, never honoured:
+    # no session younger than MIN_AGE_DAYS may be pruned, period.
+    floor = max(threshold, MIN_AGE_DAYS)
+    if floor > threshold:
+        print(yellow(f"\n  ! --older-than {threshold} is below the hard "
+                     f"{MIN_AGE_DAYS}-day floor; using {floor} days."))
+
+    candidates, unsafe, locked = [], [], []
     for s in sessions:
         if str(s.rel) in protected:
             continue
-        if s.idle_days < threshold:
+        if s.idle_days < floor:
+            continue
+        if s.uuid and s.uuid in locks:
+            locked.append(s)
             continue
         backed, bsize = backup_status(s, dest)
         if args.checksum and backed:
@@ -387,10 +435,13 @@ def cmd_prune(args):
             unsafe.append(s)
 
     reclaim = sum(s.size for s in candidates)
-    print(bold(f"\nPrune plan — local sessions idle ≥ {threshold} days "
+    print(bold(f"\nPrune plan — local sessions idle ≥ {floor} days "
                f"(keeping {keep} newest)"))
     print(f"  {green('safe to delete (verified in backup)')}: "
           f"{len(candidates)} files, {bold(human(reclaim))}")
+    if locked:
+        print(f"  {yellow('live session (writer lock held) — kept')}: "
+              f"{len(locked)} files, {human(sum(s.size for s in locked))}")
     if unsafe:
         print(f"  {red('NOT backed up — will be kept')}: "
               f"{len(unsafe)} files, {human(sum(s.size for s in unsafe))}")
@@ -412,6 +463,11 @@ def cmd_prune(args):
         for s in unsafe[:20]:
             print(f"    {s.date}  {human(s.size):>8}  {s.rel}")
 
+    if locked and args.verbose:
+        print(yellow("\n  kept (live writer lock):"))
+        for s in locked[:20]:
+            print(f"    {s.date}  {human(s.size):>8}  {s.rel}")
+
     if not args.apply:
         print(yellow(f"\n  Dry-run. Re-run with --apply to delete the "
                      f"{len(candidates)} verified files and free {human(reclaim)}."))
@@ -421,14 +477,32 @@ def cmd_prune(args):
         print(dim("\n  Nothing to prune."))
         return 0
 
+    # Deletion is interactive-only. A scheduled job, agent, or any other
+    # non-tty context must not be able to delete local history — the exact
+    # failure mode behind the 2026-09-02 mass deletion.
+    if not sys.stdin.isatty():
+        print(red("\n  ✗ Refusing to delete: prune --apply requires an interactive "
+                  "terminal (stdin is not a tty). Nothing was deleted. Run the "
+                  "dry-run, review it, then re-run --apply from a terminal."))
+        return 1
+
     deleted, freed = 0, 0
     for s in candidates:
-        # re-verify at delete time — the backup is the safety net
+        # Re-verify at delete time — the backup is the safety net, and the
+        # world can change between the plan and the unlink.
         backed, _ = backup_status(s, dest)
+        if args.checksum and backed:
+            backed = _files_identical(s.path, dest / s.rel)
         if not backed:
-            print(yellow(f"  ! skip (backup vanished): {s.rel}"))
+            print(yellow(f"  ! skip (backup not verified): {s.rel}"))
+            continue
+        if s.uuid and s.uuid in live_locks():
+            print(yellow(f"  ! skip (session went live): {s.rel}"))
             continue
         try:
+            if s.path.stat().st_mtime > now_ts() - floor * 86400:
+                print(yellow(f"  ! skip (mtime refreshed): {s.rel}"))
+                continue
             sz = s.path.stat().st_size
             s.path.unlink()
             deleted += 1
@@ -549,7 +623,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prune", parents=[common],
                         help="delete local sessions idle > N days (verified in backup)")
     pr.add_argument("--older-than", type=int, required=True, metavar="DAYS",
-                    help="delete sessions idle at least this many days")
+                    help="delete sessions idle at least this many days "
+                         f"(hard minimum {MIN_AGE_DAYS}; smaller values are clamped)")
     pr.add_argument("--keep-recent", type=int, default=5, metavar="N",
                     help="always keep the N newest sessions (default 5)")
     pr.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")

@@ -6,12 +6,21 @@ All notable changes to **mac-optimize** are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-- **`workspace-audit`** — read-only full-workspace Git inventory and private
-  Markdown/JSON reports. It records repository state, commit recency, filesystem
-  mtime, linked worktree findings, mounted-volume capacity, and ranked
-  archive/backup recommendations while never moving, deleting, pruning, or
-  changing Git state.
+### Fixed
+- **`codex-backup` prune can no longer delete anything unattended, and never
+  prunes anything under 30 days.** `prune --apply` now requires an
+  interactive terminal: a scheduled job, cron, or any non-tty invocation is
+  refused outright (exit 1, nothing deleted), with no override flag — so
+  launchd, cron, and unattended agent runs can no longer delete local
+  sessions (the vector behind the 2026-09-02 mass deletion). An in-process
+  check cannot stop a local process that deliberately wraps a pty; the
+  guarantee is "non-tty automation is refused", not "nothing else can prune".
+  `--older-than` values below a hard 30-day floor are clamped, never
+  honoured. Sessions holding a live writer lock
+  (`~/.codex/thread-writer-locks/<uuid>.lock`) are always kept, at both
+  plan and delete time, and each candidate is re-verified against the
+  backup (and with `--checksum`, byte-compared) immediately before
+  unlinking. Test harness extends to cover all guards (35 passing).
 
 ## [1.3.1] - 2026-09-03
 
