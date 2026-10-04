@@ -7,14 +7,43 @@ All notable changes to **mac-optimize** are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **The safe reclaim tier no longer deletes Playwright's browser cache.** It did
+  `rm -rf ~/Library/Caches/ms-playwright`, which reclaims *nothing*: a Playwright
+  browser is a pinned ~560 MB **binary**, not a rebuildable package cache, so the
+  next test run re-downloads the exact bytes that were just freed. Caught in the
+  act — the weekly launchd reclaim freed 1010 MB at 11:00 and the browser dirs
+  were re-created at 11:05 and 11:14. It now prunes **superseded revisions only**
+  (`am_browser_cache_prune`), never one an installed `playwright-core` pins
+  (read from its `.links` map), never one in use, keeping newest-N as a rollback
+  margin. Same treatment for `~/.cache/puppeteer`.
+- **`codex-backup` test flake.** The `verify reports 7 verified` assertion piped
+  the tool straight into `grep -q`, which races under `set -o pipefail`: the first
+  line matches, `grep` exits, and python's remaining buffered writes get `EPIPE`,
+  failing the pipeline. Measured 295/300 failures in isolation and ~1 run in 7 in
+  the suite; now captures first, then greps (300/300 clean).
+
+### Added
+- **`browser-guard`** (shared via [`agent-machine-lib`](https://github.com/kylebrodeur/agent-machine-lib)):
+  one shared browser directory for every Playwright/Puppeteer install, so no repo
+  pays a separate ~560 MB download. `status` reports what is shared/pinned/
+  reclaimable, `adopt` materialises every revision the installed repos pin
+  (symlinked over a real Chrome for Testing — no bytes copied), `check` asserts
+  the shared root satisfies them, `gc` removes superseded revisions plus
+  agent-browser's orphaned Chromes, `env` prints the shell exports. Each revision
+  dir symlinks a real Chrome; the `chrome-headless-shell` is **hardlink-copied**
+  so the shared root still works if `ms-playwright` is deleted outright. Verified:
+  with the env applied, `npx playwright install chromium` in a repo is a no-op.
+  Read-only except `adopt` and `gc`.
+- `make test` runs `test/browser-cache-prune.sh`, asserting a pinned browser
+  survives the safe tier while superseded ones are still reaped.
 - **`codex-backup` prune can no longer delete anything unattended, and never
   prunes anything under 30 days.** `prune --apply` now requires an
   interactive terminal: a scheduled job, cron, or any non-tty invocation is
   refused outright (exit 1, nothing deleted), with no override flag — so
   launchd, cron, and unattended agent runs can no longer delete local
-  sessions (the vector behind the 2026-09-02 mass deletion). An in-process
-  check cannot stop a local process that deliberately wraps a pty; the
-  guarantee is "non-tty automation is refused", not "nothing else can prune".
+  sessions. An in-process check cannot stop a local process that
+  deliberately wraps a pty; the guarantee is "non-tty automation is
+  refused", not "nothing else can prune".
   `--older-than` values below a hard 30-day floor are clamped, never
   honoured. Sessions holding a live writer lock
   (`~/.codex/thread-writer-locks/<uuid>.lock`) are always kept, at both

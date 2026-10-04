@@ -87,9 +87,13 @@ check "on-drive index json written"       "[ -f '$BACKUP_ROOT/codex-index.json' 
 check "on-drive index tsv written"        "[ -f '$BACKUP_ROOT/codex-index.tsv' ]"
 
 echo "== verify =="
-"$TOOL" verify >/dev/null 2>&1
-check "verify exit 0 (all backed up)"     "[ \$? -eq 0 ]"
-check "verify reports 7 verified"         "\"$TOOL\" verify | grep -q '7'"
+# Capture, then grep. Piping the tool straight into `grep -q` races under
+# `set -o pipefail`: the first line ("Verify: 7 local sessions") matches, grep
+# exits, and python's remaining buffered writes get EPIPE — which pipefail then
+# reports as a failed pipeline. That made this assertion flake ~1 run in 7.
+VOUT="$("$TOOL" verify 2>&1)"; VRC=$?
+check "verify exit 0 (all backed up)"     "[ \"\$VRC\" -eq 0 ]"
+check "verify reports 7 verified"         "printf '%s' \"\$VOUT\" | grep -q '7'"
 
 echo "== prune dry-run (default) =="
 DRY="$("$TOOL" prune --older-than 30 --keep-recent 1 2>&1)"

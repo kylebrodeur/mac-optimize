@@ -192,6 +192,49 @@ df -h /System/Volumes/Data | tail -1
 **Expect:** reclaims caches, prints a summary. Nothing you were using breaks.
 Re-running immediately should reclaim ≈0 (idempotent).
 
+**Browser caches are the one entry that is not "safe by construction".** A
+Playwright browser is a pinned *binary*, so deleting the whole cache frees
+nothing — the next test run re-downloads the same bytes. The safe tier must
+therefore report each browser revision as *kept* (pinned) or *removed*
+(superseded), never as "playwright cache" wholesale.
+
+```bash
+# Every pinned revision must be named as kept, and the cache must not shrink.
+before=$(du -sk "$HOME/Library/Caches/ms-playwright" | cut -f1)
+./bin/mac-reclaim
+after=$(du -sk "$HOME/Library/Caches/ms-playwright" | cut -f1)
+echo "ms-playwright before=${before}K after=${after}K   # must be unchanged"
+./bin/browser-guard check      # every pinned revision satisfied
+```
+
+**Expect:** `chromium r<rev> kept — pinned by an installed playwright-core` lines,
+`before == after`, and `browser-guard check` exiting 0.
+
+**STOP if:** `ms-playwright` shrank. That is the regression this guards: a
+Playwright browser does not rebuild on demand, so the next `playwright install`
+pays the full ~560 MB again. The weekly launchd reclaim used to do exactly
+this — 1010 MB freed at 11:00, browser dirs back by 11:14.
+
+### 4c-bis. Shared browser (browser-guard)
+
+```bash
+browser-guard status           # what is shared, pinned, reclaimable
+browser-guard adopt            # materialise every revision the repos pin
+browser-guard env              # the shell exports that wire it up
+browser-guard gc --dry-run     # superseded revisions + agent-browser orphans
+```
+
+**Expect:** `adopt` links each pinned revision into the shared root (symlinks to a
+real Chrome for Testing — no bytes copied), and with the env applied
+`npx playwright install chromium` inside a repo is a **no-op**.
+
+```bash
+cd <any repo with playwright>
+npx playwright install chromium   # must NOT download a browser
+```
+
+**STOP if** it downloads ~560 MB: the shared root is not satisfying the pin.
+
 ### 4d. Deep tier
 
 **workspaceStorage safety guard.** Orphaned VS Code

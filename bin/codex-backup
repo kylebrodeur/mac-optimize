@@ -479,7 +479,7 @@ def cmd_prune(args):
 
     # Deletion is interactive-only. A scheduled job, agent, or any other
     # non-tty context must not be able to delete local history — the exact
-    # failure mode behind the 2026-09-02 mass deletion.
+    # failure mode this guard exists to prevent.
     if not sys.stdin.isatty():
         print(red("\n  ✗ Refusing to delete: prune --apply requires an interactive "
                   "terminal (stdin is not a tty). Nothing was deleted. Run the "

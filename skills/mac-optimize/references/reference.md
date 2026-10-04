@@ -24,11 +24,41 @@ Environment:
 
 Allowlist: `~/.config/mac-reclaim/keep.txt` — one path substring per line; any candidate whose path matches is never pruned.
 
-Safe tier clears: `~/.npm/_cacache` + `_npx`, `pnpm store prune`, `uv cache prune`, `brew cleanup -s`, `bun pm cache rm`, `~/.cache/codex-runtimes`, `~/.cache/node`, `*.ShipIt` updaters, VS Code `CachedExtensionVSIXs`/`Cache`/`CachedData`/`Crashpad`, and stale app logs.
+Safe tier clears: `~/.npm/_cacache` + `_npx`, `pnpm store prune`, `uv cache prune`, `brew cleanup -s`, `bun pm cache rm`, `~/.cache/codex-runtimes`, `~/.cache/node`, `*.ShipIt` updaters, VS Code `CachedExtensionVSIXs`/`Cache`/`CachedData`/`Crashpad`, stale app logs, and **superseded browser revisions**.
+
+**Browser caches are not "safe by construction" like the rest.** A Playwright/Puppeteer browser is a pinned *binary*; `rm -rf`-ing the cache frees nothing because the next test run re-downloads the same bytes. `am_browser_cache_prune` therefore removes only *superseded* revisions of `ms-playwright` and `~/.cache/puppeteer` and keeps: any revision an installed `playwright-core` pins (read from its `.links` map), any revision in use per `lsof`, and the newest `BROWSER_KEEP_NEWEST` (default 1) unreferenced revisions as a rollback margin. To stop the download entirely, see `browser-guard` below.
 
 Deep tier: orphaned VS Code `workspaceStorage` is reported as **REVIEW/protected** and is never auto-removed; reclaim it manually, archive-first (tar `chatSessions/` + `chatEditingSessions/` + `workspace.json`, verify, then delete — skipping unmounted `/Volumes/` paths, re-checking the folder is gone). Only Task-1 primitives shipped in `bin/vscode-chat-backup`; the full encrypted workflow is archived under `docs/superpowers/_archive/`. The only deep-delete candidates (only when idle > `KEEP_DAYS`, beyond newest `KEEP_RECENT`, not open per `lsof`, not allowlisted) are `vm_bundles`, `local-agent-mode-sessions`, and `~/.claude/projects`.
 
 Log: `~/Library/Logs/mac-reclaim.log`, self-capped to the last 500 lines.
+
+## browser-guard
+
+One shared browser directory for every Playwright/Puppeteer install, so no repo pays a ~560 MB re-download. Shared via `agent-machine-lib` (same copy as `wsl-optimize`).
+
+```
+browser-guard status               # shared root, pinned revisions, reclaimable
+browser-guard adopt [ROOT ...]     # materialise every revision the repos pin
+browser-guard check  [ROOT ...]    # assert the shared root satisfies every pin (exit 1 on drift)
+browser-guard gc                   # remove superseded revisions + agent-browser orphans
+browser-guard env                  # print the shell exports to wire it up
+```
+
+Options: `--dry-run`, `--root DIR`, `--keep N`.
+
+Each revision dir is a **symlink** to a real Chrome for Testing (agent-browser's copy preferred: a distinct bundle from the user's daily Chrome, so a headless run can never shadow their real browser). The `chrome-headless-shell` is **hardlink-copied** instead, so the shared root keeps working if `ms-playwright` is deleted outright. Nothing is downloaded, and no bytes are duplicated.
+
+Env: `BROWSER_GUARD_ROOT` (default `~/.cache/browsers` — deliberately *outside* the caches a reclaim walks), `BROWSER_KEEP_NEWEST`. Wiring:
+
+```sh
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/browsers"
+export PUPPETEER_CACHE_DIR="$HOME/.cache/browsers"
+export PUPPETEER_SKIP_DOWNLOAD=1
+```
+
+With those set, `npx playwright install chromium` inside any repo is a no-op (browsers already present at the shared path). Read-only except `adopt` and `gc`.
+
+> `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` does **not** stop `playwright install` — it only gates the npm postinstall hook. Verified: with it set, the command still downloaded 580 MB.
 
 ## worktree-audit
 

@@ -1,7 +1,7 @@
 ---
 name: mac-optimize
-description: Diagnose and reclaim disk space, audit stray git worktrees, back up and prune Codex agent sessions, check SSD health, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", "find/clean git worktrees", "back up my codex sessions", "prune old codex/agent sessions", or "check my SSD/drive health"; or for routine maintenance. Drives the diskreport, mac-reclaim, worktree-audit, codex-backup, and diskhealth command-line tools with a safety-first workflow.
-compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, worktree-audit, codex-backup, diskhealth). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
+description: Diagnose and reclaim disk space, audit stray git worktrees, back up and prune Codex agent sessions, check SSD health, and stay ahead of memory pressure on a macOS dev machine that runs many AI coding agents. Use when the Mac is low on disk, filling up, low on memory, or feels slow; when the user says "clean up my mac", "free up space", "reclaim disk", "what's using my disk", "prune caches", "why is my mac slow", "find/clean git worktrees", "back up my codex sessions", "prune old codex/agent sessions", "stop playwright downloading chromium", or "check my SSD/drive health"; or for routine maintenance. Drives the diskreport, mac-reclaim, browser-guard, worktree-audit, codex-backup, and diskhealth command-line tools with a safety-first workflow.
+compatibility: Requires macOS with the mac-optimize tools on PATH (diskreport, mac-reclaim, browser-guard, worktree-audit, codex-backup, diskhealth). Install them from the mac-optimize repo (see the mac-optimize-setup skill).
 license: MIT
 metadata:
   author: kylebrodeur
@@ -50,6 +50,22 @@ mac-reclaim
 ```
 
 Default mode clears only caches that rebuild on demand and leftover installers/logs. This is **safe by construction**: `pnpm store prune`/`uv cache prune` remove only unreferenced packages; `npm`'s `_cacache` is a re-download cache; installed `node_modules` are never touched. Nothing you're using can be lost. Run this freely.
+
+**Browser caches are the exception — never `rm -rf` them to free space.** A
+Playwright/Puppeteer browser is a pinned *binary*, not a rebuildable cache: delete
+it and the next test run re-downloads the same hundreds of MB. `mac-reclaim` now
+prunes these revision-by-revision (superseded only, never one an installed
+`playwright-core` pins). Keep it that way, and to stop the download entirely point
+every repo at one shared browser:
+
+```
+browser-guard status           # what is shared / pinned / reclaimable
+browser-guard adopt            # materialise every revision the installed repos pin
+browser-guard env              # the shell exports that wire it up (add to your rc)
+browser-guard gc --dry-run     # superseded revisions + agent-browser's orphaned Chromes
+```
+
+With the env applied, `npx playwright install chromium` inside any repo is a no-op.
 
 ## 3. Deeper reclaim — ALWAYS dry-run first
 
