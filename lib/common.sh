@@ -110,10 +110,122 @@ am_stale_entries(){
   } | sort -rn | tail -n +$((keep + 1)) | cut -d' ' -f2-
 }
 
+# ── browser caches ───────────────────────────────────────────────────────────
+# Playwright's cache is the ONE entry in the safe tier that is NOT safe by
+# construction. Its other entries are purpose-built pruners (pnpm store prune
+# drops unreferenced packages only; npm's _cacache is a re-download cache), but
+# `rm -rf ms-playwright` destroys a ~560 MB pinned *binary* that does not
+# rebuild on demand — Playwright hard-fails with "Executable doesn't exist"
+# and the next agent run pays the full download again. Deleting the whole cache
+# to reclaim its bytes costs the same bytes back, on a delay.
+#
+# So: prune superseded revisions only, and never a revision an installed
+# playwright-core still pins. That keeps the reclaim useful (old revisions
+# still go) without turning the next test run into a download.
+
+# Prints "name revision" pairs from a Playwright browsers.json.
+# No JSON parser available (zero-dependency contract), and the file is
+# machine-generated with a fixed key order — `name` is always immediately
+# followed by `revision` — so flattening and matching is reliable here.
+am_browsers_json_revisions(){
+  local f="$1"
+  [ -r "$f" ] || return 0
+  tr -d '[:space:]' < "$f" \
+    | grep -o '"name":"[^"]*","revision":"[^"]*"' \
+    | sed -e 's/^"name":"//' -e 's/","revision":"/ /' -e 's/"$//'
+}
+
+# Prints "name revision" for every browser an install that uses THIS cache
+# pins. The `.links` map is exactly the right source: Playwright writes one
+# entry per playwright-core package that has installed into this cache, so a
+# linked package is by definition a live consumer. A link whose package has
+# been deleted resolves to nothing and contributes no pins.
+am_browser_cache_refs(){
+  local root="$1" link pkg
+  [ -d "$root/.links" ] || return 0
+  for link in "$root"/.links/*; do
+    [ -f "$link" ] || continue
+    pkg="$(cat "$link" 2>/dev/null)"
+    [ -n "$pkg" ] && am_browsers_json_revisions "$pkg/browsers.json"
+  done | sort -u
+}
+
+# am_browser_cache_prune <cache_root> <dry:0|1> <emit_fn>
+# Removes superseded browser revisions, keeping:
+#   * any revision pinned by an installed playwright-core (.links),
+#   * any revision a process currently has open (never yank a running binary),
+#   * the newest $BROWSER_KEEP_NEWEST unreferenced revisions (rollback margin).
+am_browser_cache_prune(){
+  local root="$1" dry="${2:-0}" emit="${3:-am_default_emit}"
+  [ -d "$root" ] || return 0
+  local keep="${BROWSER_KEEP_NEWEST:-1}"
+  local refs; refs="$(am_browser_cache_refs "$root")"
+
+  # Collect "<mtime> <name> <revision> <path>" for revision dirs.
+  local cand="" d base rev
+  for d in "$root"/*; do
+    [ -d "$d" ] || continue
+    base="${d##*/}"
+    case "$base" in .*) continue ;; esac
+    rev="${base##*-}"
+    case "$rev" in ''|*[!0-9]*) continue ;; esac   # only <name>-<digits>
+    cand="$cand$(am_mtime "$d") ${base%-*} $rev $d
+"
+  done
+  [ -n "$cand" ] || return 0
+
+  # Pass 1: drop referenced revisions from consideration.
+  # Directory names and browsers.json names disagree on separators --
+  # `chromium_headless_shell-1243` on disk is `chromium-headless-shell` in the
+  # json -- so normalise both sides before comparing, or a pinned browser looks
+  # unreferenced and gets deleted.
+  local refs_norm; refs_norm="$(printf '%s\n' "$refs" | tr '-' '_')"
+  local unreferenced="" line mt nm rv path
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    mt="${line%% *}"; line="${line#* }"
+    nm="${line%% *}"; line="${line#* }"
+    rv="${line%% *}"; path="${line#* }"
+    if printf '%s\n' "$refs_norm" | grep -qx "$nm $rv"; then
+      "$emit" SKIP "$nm r$rv kept — pinned by an installed playwright-core"
+    elif am_in_use "$path"; then
+      "$emit" SKIP "$nm r$rv kept — currently in use"
+    else
+      unreferenced="$unreferenced$mt $nm $rv $path
+"
+    fi
+  done <<< "$cand"
+
+  # Pass 2: newest-first, keep a rollback margin, discard the rest.
+  local seen=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    mt="${line%% *}"; line="${line#* }"
+    nm="${line%% *}"; line="${line#* }"
+    rv="${line%% *}"; path="${line#* }"
+    seen=$((seen + 1))
+    if [ "$seen" -le "$keep" ]; then
+      "$emit" SKIP "$nm r$rv kept — newest $keep unreferenced revision(s)"
+      continue
+    fi
+    if [ "$dry" -eq 1 ]; then
+      "$emit" SKIP "would: remove superseded $nm r$rv ($(am_mib "$(am_du_kb "$path")") MiB)"
+    else
+      local freed; freed="$(am_mib "$(am_du_kb "$path")")"
+      if rm -rf "$path" 2>/dev/null; then
+        "$emit" ACTION "removed superseded $nm r$rv (frees ${freed} MiB)"
+      else
+        "$emit" SKIP "could not remove $nm r$rv"
+      fi
+    fi
+  done <<< "$(printf '%s' "$unreferenced" | sort -rn)"
+}
+
 # ── safe-tier cache reclaim ──────────────────────────────────────────────────
-# Identical on macOS and WSL2: these are package-manager caches, and every one
-# is rebuilt on demand by its owning tool. Safe *by construction* — not by
-# carefulness — because of what they are, not how carefully we delete them.
+# Mostly package-manager caches, all rebuilt on demand by their owning tool.
+# Safe *by construction* — not by carefulness — because of what they are, not
+# how carefully we delete them. The browser cache is the exception, and goes
+# through am_browser_cache_prune instead of rm -rf (see above).
 #
 # am_reclaim_caches <dry:0|1> <emit_fn>
 # emit_fn is called as: emit_fn ACTION|SKIP "message"
@@ -144,14 +256,24 @@ am_reclaim_caches(){
 
   command -v cargo-cache >/dev/null 2>&1 && _try "cargo cache --autoclean" cargo cache --autoclean
 
+  # Browser binaries: superseded revisions only, never a pinned one. NOT the
+  # rm -rf that used to be here — see the browser-caches section above for why
+  # deleting the whole cache costs back every byte it reclaims.
+  case "$AM_PLATFORM" in
+    macos) d="$HOME/Library/Caches/ms-playwright" ;;
+    *)     d="$HOME/.cache/ms-playwright" ;;
+  esac
+  am_browser_cache_prune "$d" "$dry" "$emit"
+  # Puppeteer keeps its own cache (Chrome-for-Testing builds) in the same style,
+  # at the same path on both platforms.
+  am_browser_cache_prune "$HOME/.cache/puppeteer" "$dry" "$emit"
+
   # Platform-specific tail.
   case "$AM_PLATFORM" in
     macos)
-      d="$HOME/Library/Caches/ms-playwright"; [ -d "$d" ] && _try "playwright cache" rm -rf "$d"
       command -v brew >/dev/null 2>&1 && _try "brew cleanup -s" brew cleanup -s
       ;;
     wsl2|linux)
-      d="$HOME/.cache/ms-playwright"; [ -d "$d" ] && _try "playwright cache" rm -rf "$d"
       # apt and journald need root; only touch them with passwordless sudo.
       if [ -d /var/cache/apt/archives ]; then
         if sudo -n true 2>/dev/null; then _try "apt-get clean" sudo -n apt-get clean

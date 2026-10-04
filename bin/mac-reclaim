@@ -5,6 +5,11 @@
 #   SAFE (default): caches tools rebuild on demand + leftover installers + stale
 #     logs. Safe *by construction* — pnpm/uv decide what's unreferenced; npm's
 #     _cacache is a redownload cache; node_modules are never touched.
+#     Browser caches are the exception: a Playwright browser is a pinned BINARY,
+#     so it is pruned revision-by-revision (superseded only, never one an
+#     installed playwright-core pins) rather than deleted wholesale. Deleting
+#     the whole cache reclaims nothing — the next run re-downloads it.
+#     Run `browser-guard env` to serve every repo from one shared directory.
 #   DEEP (--deep): stale agent STATE. Removed only with EVIDENCE it's unused:
 #     - VS Code workspaceStorage: orphaned directories are reported as
 #       review/protected only and never removed until an archive-first backup

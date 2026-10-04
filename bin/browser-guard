@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# browser-guard — one shared browser for every Playwright/Puppeteer install, so
+# a repo never pays a ~560 MB re-download.
+#
+# WHY THIS EXISTS
+#   Playwright's browser cache is a pinned *binary*, not a rebuildable cache.
+#   Deleting it does not "reclaim" anything: the next test run re-downloads the
+#   same bytes. Meanwhile `PLAYWRIGHT_BROWSERS_PATH=0` (documented by more than
+#   one repo) vendors a private copy into every node_modules, so the same
+#   Chrome is stored once per repo.
+#
+#   This tool points every install at ONE directory of symlinks over a real
+#   Chrome for Testing, so the bytes exist once, a cache prune cannot orphan a
+#   pinned browser, and `playwright install` becomes a no-op when it is already
+#   satisfied.
+#
+# USAGE
+#   browser-guard status                 what is shared, what is pinned, what is reclaimable
+#   browser-guard adopt [ROOT ...]       materialise every revision the repos pin
+#   browser-guard check  [ROOT ...]      assert the shared dir satisfies every pin (exit 1 on drift)
+#   browser-guard gc                     remove superseded revisions from the shared dir
+#   browser-guard env                    print the shell exports to wire it up
+#
+#   Options: --dry-run  --root DIR  --keep N
+#
+# Env: BROWSER_GUARD_ROOT (default ~/.cache/browsers), BROWSER_KEEP_NEWEST.
+# Read-only except `adopt` and `gc`.
+
+set -uo pipefail
+
+AM_TOOL=browser-guard
+_am_find_lib() {
+  local self_dir; self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local c
+  for c in "${AM_LIB:-}" \
+           "$self_dir/../lib/common.sh" \
+           "$HOME/.local/lib/agent-machine/common.sh" \
+           "$HOME/.local/lib/mac-optimize/common.sh" \
+           "$HOME/.local/lib/wsl-optimize/common.sh"; do
+    [ -n "$c" ] && [ -r "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+_AM_LIB_PATH="$(_am_find_lib)" || {
+  printf '%s: cannot find lib/common.sh (set $AM_LIB to its path)\n' "${0##*/}" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+. "$_AM_LIB_PATH"
+
+# The shared root MUST live outside the caches a prune walks, or the weekly
+# reclaim would eat it. ~/.cache/browsers is deliberately a third location.
+BROWSER_GUARD_ROOT="${BROWSER_GUARD_ROOT:-$HOME/.cache/browsers}"
+DRY=0; KEEP="${BROWSER_KEEP_NEWEST:-1}"; ROOTS=(); CMD=""
+
+for a in "$@"; do
+  case "$a" in
+    --dry-run|-n) DRY=1 ;;
+    --keep)       KEEP_NEXT=1 ;;
+    --root)       ROOT_NEXT=1 ;;
+    --help|-h)    sed -n '2,30p' "$0"; exit 0 ;;
+    --*)          printf 'unknown flag: %s\n' "$a" >&2; exit 2 ;;
+    *)
+      if [ "${KEEP_NEXT:-0}" = 1 ]; then KEEP="$a"; KEEP_NEXT=0
+      elif [ "${ROOT_NEXT:-0}" = 1 ]; then BROWSER_GUARD_ROOT="$a"; ROOT_NEXT=0
+      elif [ -z "$CMD" ]; then CMD="$a"
+      else ROOTS+=("$a"); fi ;;
+  esac
+done
+[ -n "$CMD" ] || CMD=status
+
+# Scan roots for playwright-core installs. Bounded depth: a full node_modules
+# walk is far more expensive than this is worth.
+default_roots(){
+  if [ "${#ROOTS[@]}" -gt 0 ]; then printf '%s\n' "${ROOTS[@]}"; return; fi
+  if [ -n "${WORKSPACE_ROOTS:-}" ]; then printf '%s\n' $WORKSPACE_ROOTS; return; fi
+  printf '%s\n' "$HOME/workspace"
+}
+
+# Prints one absolute path per line: <pkg>/browsers.json
+find_playwright_installs(){
+  local root
+  while IFS= read -r root; do
+    [ -d "$root" ] || continue
+    find "$root" -maxdepth 6 -type f -path '*/node_modules/playwright-core/browsers.json' \
+      -not -path '*/node_modules/*/node_modules/*' 2>/dev/null
+  done < <(default_roots) | sort -u
+}
+
+# "name revision" for every chromium-family browser the installed repos pin.
+# tip-of-tree entries are excluded: Playwright does not install them by default
+# (`installByDefault: false`), so nothing expects a shared copy of one.
+pinned_chromium(){
+  local json
+  while IFS= read -r json; do
+    [ -r "$json" ] || continue
+    # `tr -d '[:space:]'` first: browsers.json is machine-generated with a fixed
+    # key order, so name is always immediately followed by revision.
+    tr -d '[:space:]' < "$json" \
+      | grep -o '"name":"chromium[^"]*","revision":"[^"]*","installByDefault":true' \
+      | sed -e 's/^"name":"//' -e 's/","revision":"/ /' -e 's/","installByDefault":true$//'
+  done < <(find_playwright_installs) | sort -u
+}
+
+# Where a real Chrome for Testing platform dir already exists, best first.
+# agent-browser's copy is preferred: it is a distinct bundle from the user's
+# daily Chrome, so a headless run can never shadow their real browser window.
+# Within a source, newest first — an older Chrome can lag the pinned revision.
+chrome_sources(){
+  local d
+  for d in $(ls -1d "$HOME"/.agent-browser/browsers/chrome-* 2>/dev/null | sort -Vr); do
+    [ -x "$d/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" ] \
+      && printf '%s\n' "$d"
+  done
+  for d in $(ls -1d "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-*/ 2>/dev/null | sort -Vr); do
+    case "$d" in *headless*) continue ;; esac
+    [ -d "$d/Google Chrome for Testing.app" ] && printf '%s\n' "${d%/}"
+  done
+}
+
+# The headless shell has no substitute: it is a separate binary and only
+# Playwright's own cache ships it. Default headless launches need it.
+shell_sources(){
+  local rev="$1" d
+  for d in "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-"$rev"/chrome-headless-shell-*/ \
+           "$HOME"/.cache/ms-playwright/chromium_headless_shell-"$rev"/chrome-headless-shell-*/; do
+    [ -d "$d" ] && printf '%s\n' "${d%/}"
+  done
+}
+
+# Playwright's platform subdir for a browser name.
+platform_dir(){
+  case "$1" in
+    *headless*) printf 'chrome-headless-shell-mac-arm64\n' ;;
+    *)          printf 'chrome-mac-arm64\n' ;;
+  esac
+}
+
+# Playwright's on-disk directory name for a browser. browsers.json calls it
+# `chromium-headless-shell` but the directory it creates is
+# `chromium_headless_shell-<rev>` -- hyphens in the json, underscores on disk.
+dir_name_for(){
+  printf '%s-%s\n' "$(printf '%s' "$1" | tr '-' '_')" "$2"
+}
+
+executable_in(){
+  local root="$1" name="$2" rev="$3"
+  local sub; sub="$(platform_dir "$name")"
+  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+    printf '%s/%s/%s/chrome-headless-shell\n' "$root" "$(dir_name_for "$name" "$rev")" "$sub"
+  else
+    printf '%s/%s/%s/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n' \
+      "$root" "$(dir_name_for "$name" "$rev")" "$sub"
+  fi
+}
+
+# sha1, for writing Playwright-compatible .links entries.
+sha1_of(){
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 1 | awk '{print $1}'
+  else printf '%s' "$1" | openssl dgst -sha1 | awk '{print $NF}'; fi
+}
+
+# Register the playwright-core packages this root serves, so a prune can see
+# the revisions are referenced. Without this the shared root looks unreferenced.
+write_links(){
+  local json pkg
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$BROWSER_GUARD_ROOT/.links"
+  while IFS= read -r json; do
+    [ -r "$json" ] || continue
+    pkg="${json%/browsers.json}"
+    printf '%s\n' "$pkg" > "$BROWSER_GUARD_ROOT/.links/$(sha1_of "$pkg")"
+  done < <(find_playwright_installs)
+}
+
+materialise(){
+  local name="$1" rev="$2" src kind
+  local dir="$BROWSER_GUARD_ROOT/$(dir_name_for "$name" "$rev")"
+  local sub; sub="$(platform_dir "$name")"
+  local exe; exe="$(executable_in "$BROWSER_GUARD_ROOT" "$name" "$rev")"
+
+  if [ -x "$exe" ]; then am_ok "$name r$rev already present"; return 0; fi
+
+  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+    src="$(shell_sources "$rev" | head -1)"; kind="ms-playwright shell"
+  else
+    src="$(chrome_sources | head -1)"; kind="Chrome for Testing"
+  fi
+
+  if [ -z "$src" ]; then
+    if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+      am_warn "$name r$rev — no local headless shell. Run 'npx playwright install chromium' once, or set channel:\"chromium\" to avoid needing it."
+    else
+      am_warn "$name r$rev — no local Chrome for Testing. Run 'agent-browser install' once."
+    fi
+    return 1
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    am_act "would: link $name r$rev -> $src"
+    return 0
+  fi
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  # Symlink the platform dir ITSELF, replacing it -- not into a pre-made dir,
+  # which would nest the link one level too deep and break executablePath.
+  #
+  # The headless shell is hardlink-copied rather than symlinked: symlinking it
+  # into ms-playwright would make the shared root depend on a cache that a
+  # manual `rm -rf` can wipe, which is the exact fragility this tool removes.
+  # Hardlinks share the bytes (no extra disk) but the tree stands alone. Falls
+  # back to a symlink if the source is on another filesystem.
+  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+    if ! cp -al "$src" "$dir/$sub" 2>/dev/null; then
+      ln -sfn "$src" "$dir/$sub"
+    fi
+  else
+    ln -sfn "$src" "$dir/$sub"
+  fi
+  touch "$dir/INSTALLATION_COMPLETE" "$dir/DEPENDENCIES_VALIDATED"
+  am_act "$name r$rev linked -> $kind ($src)"
+}
+
+cmd_adopt(){
+  am_hdr "adopt → $BROWSER_GUARD_ROOT"
+  mkdir -p "$BROWSER_GUARD_ROOT"
+  local pins; pins="$(pinned_chromium)"
+  if [ -z "$pins" ]; then
+    am_info "no playwright-core installs found under: $(default_roots | tr '\n' ' ')"
+    am_info "pass repos explicitly: browser-guard adopt ~/workspace/my-repo"
+  fi
+  local rc=0 name rev
+  while IFS=' ' read -r name rev; do
+    [ -n "$name" ] || continue
+    materialise "$name" "$rev" || rc=1
+  done <<< "$pins"
+  write_links
+  [ "$rc" -eq 0 ] && am_ok "shared root ready" || am_warn "some revisions need a source (see above)"
+  return "$rc"
+}
+
+cmd_check(){
+  local pins; pins="$(pinned_chromium)"
+  local missing=0 name rev exe
+  am_hdr "check"
+  while IFS=' ' read -r name rev; do
+    [ -n "$name" ] || continue
+    exe="$(executable_in "$BROWSER_GUARD_ROOT" "$name" "$rev")"
+    if [ -x "$exe" ]; then
+      am_ok "$name r$rev satisfied"
+    else
+      am_no "$name r$rev MISSING — run: browser-guard adopt"
+      missing=$((missing + 1))
+    fi
+  done <<< "$pins"
+  [ -n "$pins" ] || am_info "no playwright-core installs found to check"
+  if [ "$missing" -gt 0 ]; then
+    am_warn "$missing revision(s) unsatisfied"
+    return 1
+  fi
+  [ -n "$pins" ] && am_ok "all pinned revisions satisfied"
+  return 0
+}
+
+# agent-browser keeps one Chrome per CLI version and never removes the old ones.
+# Its live Chrome is whatever `doctor` reports; keep that plus newest-N.
+agent_browser_prune(){
+  local dry="$1" keep="$2" root="$HOME/.agent-browser/browsers"
+  [ -d "$root" ] || return 0
+  local live; live="$(agent-browser doctor 2>/dev/null \
+    | sed -n 's|.* at \(.*\)/Google Chrome for Testing.app/.*|\1|p' | head -1)"
+  local d seen=0
+  for d in $(ls -1d "$root"/chrome-* 2>/dev/null | sort -Vr); do
+    if [ -n "$live" ] && [ "$d" = "$live" ]; then
+      am_ok "agent-browser $(basename "$d") — in use"
+      continue
+    fi
+    seen=$((seen + 1))
+    if [ "$seen" -le "$keep" ]; then
+      am_info "agent-browser $(basename "$d") — kept (rollback margin)"
+      continue
+    fi
+    local mb; mb="$(am_mib "$(am_du_kb "$d")")"
+    if [ "$dry" = 1 ]; then
+      am_info "would: remove superseded agent-browser $(basename "$d") (${mb} MiB)"
+    elif rm -rf "$d" 2>/dev/null; then
+      am_act "removed superseded agent-browser $(basename "$d") (frees ${mb} MiB)"
+    else
+      am_info "could not remove $(basename "$d")"
+    fi
+  done
+}
+
+cmd_gc(){
+  am_hdr "gc → $BROWSER_GUARD_ROOT"
+  BROWSER_KEEP_NEWEST="$KEEP" am_browser_cache_prune "$BROWSER_GUARD_ROOT" "$DRY" am_default_emit
+  am_hdr "agent-browser browsers"
+  agent_browser_prune "$DRY" "$KEEP"
+}
+
+cmd_status(){
+  am_hdr "browser-guard"
+  am_row "shared root" "$BROWSER_GUARD_ROOT"
+  if [ -d "$BROWSER_GUARD_ROOT" ]; then
+    am_row "shared size" "$(am_mib "$(am_du_kb "$BROWSER_GUARD_ROOT")") MiB"
+  else
+    am_warn "shared root does not exist yet — run 'browser-guard adopt'"
+  fi
+  am_row "installs found" "$(find_playwright_installs | wc -l | tr -d ' ')"
+
+  am_hdr "pinned by installed repos"
+  local pins; pins="$(pinned_chromium)"
+  if [ -n "$pins" ]; then
+    while IFS=' ' read -r name rev; do
+      [ -n "$name" ] || continue
+      if [ -x "$(executable_in "$BROWSER_GUARD_ROOT" "$name" "$rev")" ]; then
+        am_ok "$name r$rev"
+      else
+        am_no "$name r$rev (not shared)"
+      fi
+    done <<< "$pins"
+  else
+    am_info "none"
+  fi
+
+  am_hdr "caches a prune walks"
+  local d
+  for d in "$HOME/Library/Caches/ms-playwright" "$HOME/.cache/ms-playwright" "$HOME/.cache/puppeteer"; do
+    [ -d "$d" ] && am_row "$d" "$(am_mib "$(am_du_kb "$d")") MiB"
+  done
+  am_info "reclaimable superseded revisions: browser-guard gc --dry-run"
+}
+
+cmd_env(){
+  cat <<EOF
+# browser-guard — shared browser for Playwright and Puppeteer
+export BROWSER_GUARD_ROOT="$BROWSER_GUARD_ROOT"
+export PLAYWRIGHT_BROWSERS_PATH="\$BROWSER_GUARD_ROOT"
+export PUPPETEER_CACHE_DIR="\$BROWSER_GUARD_ROOT"
+export PUPPETEER_SKIP_DOWNLOAD=1
+# Keep a superseded revision for rollback; the newest N are never reaped.
+export BROWSER_KEEP_NEWEST="\${BROWSER_KEEP_NEWEST:-1}"
+EOF
+}
+
+case "$CMD" in
+  adopt)  cmd_adopt ;;
+  check)  cmd_check ;;
+  gc)     cmd_gc ;;
+  status) cmd_status ;;
+  env)    cmd_env ;;
+  *) printf 'unknown command: %s (try --help)\n' "$CMD" >&2; exit 2 ;;
+esac
