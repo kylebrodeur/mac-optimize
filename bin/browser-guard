@@ -107,32 +107,89 @@ pinned_chromium(){
 # daily Chrome, so a headless run can never shadow their real browser window.
 # Within a source, newest first — an older Chrome can lag the pinned revision.
 chrome_sources(){
-  local d
-  for d in $(ls -1d "$HOME"/.agent-browser/browsers/chrome-* 2>/dev/null | sort -Vr); do
-    [ -x "$d/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" ] \
-      && printf '%s\n' "$d"
+  local d pwroot exerel
+  pwroot="$(pw_cache_roots)"
+  exerel="$(executable_rel chromium)"
+  for d in $(ls -1d "$(agent_browser_root)"/chrome-* 2>/dev/null | sort -Vr); do
+    [ -x "$d/$exerel" ] && printf '%s\n' "$d"
   done
-  for d in $(ls -1d "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-*/ 2>/dev/null | sort -Vr); do
+  for d in $(ls -1d "$pwroot"/chromium-*/"$(platform_dir chromium)"/ 2>/dev/null | sort -Vr); do
     case "$d" in *headless*) continue ;; esac
-    [ -d "$d/Google Chrome for Testing.app" ] && printf '%s\n' "${d%/}"
+    [ -x "$d/$exerel" ] && printf '%s\n' "${d%/}"
   done
 }
 
 # The headless shell has no substitute: it is a separate binary and only
 # Playwright's own cache ships it. Default headless launches need it.
 shell_sources(){
-  local rev="$1" d
-  for d in "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-"$rev"/chrome-headless-shell-*/ \
-           "$HOME"/.cache/ms-playwright/chromium_headless_shell-"$rev"/chrome-headless-shell-*/; do
-    [ -d "$d" ] && printf '%s\n' "${d%/}"
-  done
+  local rev="$1" sub
+  sub="$(platform_dir chromium-headless-shell)"
+  ls -1d "$(pw_cache_roots)"/chromium_headless_shell-"$rev"/"$sub"/ 2>/dev/null | sed 's:/$::'
 }
 
-# Playwright's platform subdir for a browser name.
+# ── platform ─────────────────────────────────────────────────────────────────
+# Playwright's on-disk layout differs per OS/arch. Hardcoding one machine's
+# answer is why this tool used to be macOS-arm64-only despite being vendored
+# into the Linux sibling. Derive it instead:
+#   * `pw_platform`  -> the key Playwright itself uses ("mac-arm64", ...)
+#   * `platform_dir` -> the platform subdir name for a browser
+#   * `executable_rel` -> path inside that subdir, from Playwright's own table
+# Names verified against playwright-core's EXECUTABLE_PATHS registry.
+pw_platform(){
+  case "$(uname -s)" in
+    Darwin) case "$(uname -m)" in arm64) printf 'mac-arm64\n' ;; *) printf 'mac-x64\n' ;; esac ;;
+    Linux)  case "$(uname -m)" in aarch64|arm64) printf 'linux-arm64\n' ;; *) printf 'linux-x64\n' ;; esac ;;
+    MINGW*|MSYS*|CYGWIN*) printf 'win-x64\n' ;;
+    *) printf 'linux-x64\n' ;;
+  esac
+}
+
+# Chrome for Testing layout: mac uses an .app bundle, linux ships a raw binary
+# under a different dir name, windows an .exe.
 platform_dir(){
+  local headless=0
+  case "$1" in *headless-shell*) headless=1 ;; esac
+  case "$(pw_platform)" in
+    mac-arm64) [ "$headless" = 1 ] && printf 'chrome-headless-shell-mac-arm64\n' || printf 'chrome-mac-arm64\n' ;;
+    mac-x64)   [ "$headless" = 1 ] && printf 'chrome-headless-shell-mac-x64\n'   || printf 'chrome-mac-x64\n' ;;
+    linux-arm64) [ "$headless" = 1 ] && printf 'chrome-headless-shell-linux-arm64\n' || printf 'chrome-linux-arm64\n' ;;
+    win-x64)   [ "$headless" = 1 ] && printf 'chrome-headless-shell-win64\n' || printf 'chrome-win64\n' ;;
+    *)         [ "$headless" = 1 ] && printf 'chrome-headless-shell-linux64\n' || printf 'chrome-linux64\n' ;;
+  esac
+}
+
+# Path of the executable INSIDE a platform dir (Playwright's own suffixes).
+executable_rel(){
   case "$1" in
-    *headless*) printf 'chrome-headless-shell-mac-arm64\n' ;;
-    *)          printf 'chrome-mac-arm64\n' ;;
+    *headless-shell*)
+      case "$(pw_platform)" in win-x64) printf 'chrome-headless-shell.exe\n' ;; *) printf 'chrome-headless-shell\n' ;; esac ;;
+    *)
+      case "$(pw_platform)" in
+        mac-*)  printf 'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n' ;;
+        win-x64) printf 'chrome.exe\n' ;;
+        *)      printf 'chrome\n' ;;
+      esac ;;
+  esac
+}
+
+# Directories `playwright install` itself creates, per platform. Used only to
+# tell "already provided by Playwright" apart from a genuinely missing browser.
+pw_cache_roots(){
+  case "$(pw_platform)" in
+    mac-*) printf '%s\n' "$HOME/Library/Caches/ms-playwright" ;;
+    *)     printf '%s\n' "$HOME/.cache/ms-playwright" ;;
+  esac
+}
+
+# agent-browser's browser dir name also differs by platform.
+agent_browser_root(){
+  printf '%s\n' "$HOME/.agent-browser/browsers"
+}
+agent_browser_glob(){
+  case "$(pw_platform)" in
+    mac-*) printf 'chrome-*\n' ;;
+    win-x64) printf 'chrome-*\n' ;;
+    *) printf 'chrome-*\n' ;;
   esac
 }
 
@@ -145,13 +202,8 @@ dir_name_for(){
 
 executable_in(){
   local root="$1" name="$2" rev="$3"
-  local sub; sub="$(platform_dir "$name")"
-  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
-    printf '%s/%s/%s/chrome-headless-shell\n' "$root" "$(dir_name_for "$name" "$rev")" "$sub"
-  else
-    printf '%s/%s/%s/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing\n' \
-      "$root" "$(dir_name_for "$name" "$rev")" "$sub"
-  fi
+  printf '%s/%s/%s/%s\n' "$root" "$(dir_name_for "$name" "$rev")" \
+    "$(platform_dir "$name")" "$(executable_rel "$name")"
 }
 
 # sha1, for writing Playwright-compatible .links entries.
@@ -178,20 +230,22 @@ materialise(){
   local dir="$BROWSER_GUARD_ROOT/$(dir_name_for "$name" "$rev")"
   local sub; sub="$(platform_dir "$name")"
   local exe; exe="$(executable_in "$BROWSER_GUARD_ROOT" "$name" "$rev")"
+  local headless=0
+  case "$name" in *headless-shell*) headless=1 ;; esac
 
   if [ -x "$exe" ]; then am_ok "$name r$rev already present"; return 0; fi
 
-  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+  if [ "$headless" = 1 ]; then
     src="$(shell_sources "$rev" | head -1)"; kind="ms-playwright shell"
   else
     src="$(chrome_sources | head -1)"; kind="Chrome for Testing"
   fi
 
   if [ -z "$src" ]; then
-    if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
-      am_warn "$name r$rev — no local headless shell. Run 'npx playwright install chromium' once, or set channel:\"chromium\" to avoid needing it."
+    if [ "$headless" = 1 ]; then
+      am_warn "$name r$rev — no local headless shell to reuse. Run 'npx playwright install chromium' once to obtain it, or set channel:\"chromium\" so default headless does not need it."
     else
-      am_warn "$name r$rev — no local Chrome for Testing. Run 'agent-browser install' once."
+      am_warn "$name r$rev — no local Chrome for Testing found to reuse. Install one with 'agent-browser install' (preferred) or 'npx playwright install chromium'."
     fi
     return 1
   fi
@@ -210,7 +264,7 @@ materialise(){
   # manual `rm -rf` can wipe, which is the exact fragility this tool removes.
   # Hardlinks share the bytes (no extra disk) but the tree stands alone. Falls
   # back to a symlink if the source is on another filesystem.
-  if [ "$sub" = "chrome-headless-shell-mac-arm64" ]; then
+  if [ "$headless" = 1 ]; then
     if ! cp -al "$src" "$dir/$sub" 2>/dev/null; then
       ln -sfn "$src" "$dir/$sub"
     fi
@@ -265,14 +319,23 @@ cmd_check(){
 # agent-browser keeps one Chrome per CLI version and never removes the old ones.
 # Its live Chrome is whatever `doctor` reports; keep that plus newest-N.
 agent_browser_prune(){
-  local dry="$1" keep="$2" root="$HOME/.agent-browser/browsers"
+  local dry="$1" keep="$2" root; root="$(agent_browser_root)"
   [ -d "$root" ] || return 0
+  # doctor prints "... Chrome for Testing <ver> at <dir>/<bundle>/...". The bundle
+  # differs per platform, so stop at the browser dir rather than matching a
+  # macOS-only ".app" suffix.
   local live; live="$(agent-browser doctor 2>/dev/null \
-    | sed -n 's|.* at \(.*\)/Google Chrome for Testing.app/.*|\1|p' | head -1)"
+    | sed -n 's|.* at \(.*\)/\(Google Chrome for Testing\|chrome\|chrome.exe\).*|\1|p' | head -1)"
   local d seen=0
   for d in $(ls -1d "$root"/chrome-* 2>/dev/null | sort -Vr); do
     if [ -n "$live" ] && [ "$d" = "$live" ]; then
       am_ok "agent-browser $(basename "$d") — in use"
+      continue
+    fi
+    # Never reap a browser something is actively running out of, even if it is
+    # not the one `doctor` reports (a pinned older agent-browser can still be live).
+    if am_in_use "$d"; then
+      am_ok "agent-browser $(basename "$d") — in use (process running)"
       continue
     fi
     seen=$((seen + 1))
@@ -293,7 +356,15 @@ agent_browser_prune(){
 
 cmd_gc(){
   am_hdr "gc → $BROWSER_GUARD_ROOT"
-  BROWSER_KEEP_NEWEST="$KEEP" am_browser_cache_prune "$BROWSER_GUARD_ROOT" "$DRY" am_default_emit
+  # Tell the prune which revisions the live repos pin. The shared root is
+  # populated by `adopt`, not by Playwright, so its `.links` map is not the
+  # authority here — without this it would reap a revision another repo needs
+  # and make that repo download ~560 MB again, the exact bug this tool exists
+  # to prevent.
+  local pins_flat
+  pins_flat="$(pinned_chromium | paste -sd';' - 2>/dev/null)"
+  AM_BROWSER_KEEP="$pins_flat" BROWSER_KEEP_NEWEST="$KEEP" \
+    am_browser_cache_prune "$BROWSER_GUARD_ROOT" "$DRY" am_default_emit
   am_hdr "agent-browser browsers"
   agent_browser_prune "$DRY" "$KEEP"
 }
@@ -325,9 +396,10 @@ cmd_status(){
 
   am_hdr "caches a prune walks"
   local d
-  for d in "$HOME/Library/Caches/ms-playwright" "$HOME/.cache/ms-playwright" "$HOME/.cache/puppeteer"; do
+  for d in "$(pw_cache_roots)" "$HOME/.cache/puppeteer"; do
     [ -d "$d" ] && am_row "$d" "$(am_mib "$(am_du_kb "$d")") MiB"
   done
+  am_row "platform" "$(pw_platform)"
   am_info "reclaimable superseded revisions: browser-guard gc --dry-run"
 }
 

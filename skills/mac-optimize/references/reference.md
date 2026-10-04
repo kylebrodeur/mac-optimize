@@ -58,6 +58,17 @@ export PUPPETEER_SKIP_DOWNLOAD=1
 
 With those set, `npx playwright install chromium` inside any repo is a no-op (browsers already present at the shared path). Read-only except `adopt` and `gc`.
 
+**Portable by construction.** The layout Playwright uses differs per OS/arch, so nothing is hardcoded: `pw_platform` derives the key from `uname` (`mac-arm64`, `mac-x64`, `linux-x64`, `linux-arm64`, `win-x64`), and `platform_dir`/`executable_rel` map that to Playwright's own registry table — verified against `EXECUTABLE_PATHS` in `playwright-core`. Cache roots follow the platform too (macOS `~/Library/Caches/ms-playwright`, elsewhere `${XDG_CACHE_HOME:-~/.cache}/ms-playwright`), overridable with `AM_PLAYWRIGHT_CACHE` / `AM_PUPPETEER_CACHE`. Covered by `test/browser-guard-platform.bash`.
+
+**Never reaps a browser something is running.** `am_browser_dir_in_use` resolves symlinks (a shared revision dir *is* a symlink, and `lsof +D` does not follow them) and compares inodes for the hardlink-copied shell. `am_in_use` uses two detectors because neither alone is enough:
+
+- `lsof +D` catches open file descriptors, but its **exit code is unreliable on macOS** — it returns 1 even when it matched (measured: 3 matches, exit 1), so the output must be tested, not the status. It also does not follow symlinks.
+- `pgrep -f` catches a process whose argv names the dir (how a running browser appears), with own-pid excluded so the caller's argv is not a self-match.
+
+Absence of both tools is treated as "in use" — a deletion guard must not guess.
+
+> Note: macOS `NotificationCenter` can hold a Chrome framework file open indefinitely, so `lsof` may report a browser dir "in use" when no browser is running. That errs toward keeping the directory, which is the safe direction.
+
 > `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` does **not** stop `playwright install` — it only gates the npm postinstall hook. Verified: with it set, the command still downloaded 580 MB.
 
 ## worktree-audit

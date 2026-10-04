@@ -79,12 +79,34 @@ am_mib(){   printf '%d' $(( ${1:-0} / 1024 )); }
 am_free_kb(){ df -Pk "${1:-/}" 2>/dev/null | awk 'NR==2{print $4}'; }
 
 # ── guards ───────────────────────────────────────────────────────────────────
-# True if any process holds a file open under $1. Absence of lsof is treated as
-# "in use" — refusing to guess is the safe default for a deletion guard.
+# True if any process is using $1. Two independent detectors, because neither is
+# sufficient alone:
+#   * `lsof +D` catches open files, but MISSES a running browser: measured 14
+#     live Chrome processes out of a dir while `lsof +D` reported exit 1.
+#   * `pgrep -f` catches a process whose command line names the dir, which is
+#     how a running browser shows up. Own pid is excluded so the caller's own
+#     argv (which contains the path) is never mistaken for a running process.
+# Absence of both tools is treated as "in use" — refusing to guess is the safe
+# default for a deletion guard.
 am_in_use(){
   [ -e "$1" ] || return 1
-  command -v lsof >/dev/null 2>&1 || return 0
-  lsof +D "$1" >/dev/null 2>&1
+  local found=0 pids
+  if command -v lsof >/dev/null 2>&1; then
+    # Test for OUTPUT, not exit status: lsof's exit code is unreliable on macOS
+    # — it returns 1 even when it matched (measured: 3 matches, exit 1).
+    [ -n "$(lsof -t +D "$1" 2>/dev/null)" ] && found=1
+  fi
+  if [ "$found" -eq 0 ] && command -v pgrep >/dev/null 2>&1; then
+    # Own pid excluded so the caller's argv (which contains the path) is never
+    # mistaken for a running process.
+    pids="$(pgrep -f -- "$1" 2>/dev/null | grep -vx "$$" | grep -vx "${PPID:-0}")"
+    [ -n "$pids" ] && found=1
+  fi
+  # If neither tool exists we cannot tell; refusing to guess means "in use".
+  if ! command -v lsof >/dev/null 2>&1 && ! command -v pgrep >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$found" -eq 1 ]
 }
 
 # Allowlist: one substring per line. Missing file means nothing is allowlisted.
@@ -123,6 +145,43 @@ am_stale_entries(){
 # playwright-core still pins. That keeps the reclaim useful (old revisions
 # still go) without turning the next test run into a download.
 
+# True if $1, or anything it symlinks to, is in use. A shared browser dir IS a
+# symlink, and `lsof +D` does not follow symlinks — so without resolving the
+# target first, a running browser would not protect the shared copy and a prune
+# could delete a browser out from under a live test.
+am_browser_dir_in_use(){
+  local dir="$1" target
+  am_in_use "$dir" && return 0
+  # Resolve one level: <rev>/<platform-dir> -> real browser dir. Also covers the
+  # hardlink-copied shell, where the files are shared by inode rather than path.
+  for target in "$dir"/*; do
+    [ -e "$target" ] || continue
+    if [ -L "$target" ]; then
+      local resolved; resolved="$(cd "$target" 2>/dev/null && pwd -P)" || continue
+      am_in_use "$resolved" && return 0
+    fi
+  done
+  # Hardlinks share the inode rather than the path, so a path-based check misses
+  # them. Compare inodes of the executables against open files as a final guard.
+  if command -v lsof >/dev/null 2>&1; then
+    local exe inode open_inodes
+    exe="$(find "$dir" -maxdepth 5 -type f \( -name 'chrome' -o -name 'chrome-headless-shell' -o -name 'Google Chrome for Testing' \) 2>/dev/null | head -1)"
+    if [ -n "$exe" ]; then
+      inode="$(am_inode "$exe")"
+      if [ -n "$inode" ] && [ "$inode" != 0 ]; then
+        open_inodes="$(lsof -n 2>/dev/null | awk -v n="$inode" '$0 ~ /chrome/ && $0 ~ (" " n " ") {print "hit"; exit}')"
+        [ -n "$open_inodes" ] && return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+# Inode of a path (BSD and GNU differ), 0 if unknown.
+am_inode(){
+  stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null || echo 0
+}
+
 # Prints "name revision" pairs from a Playwright browsers.json.
 # No JSON parser available (zero-dependency contract), and the file is
 # machine-generated with a fixed key order — `name` is always immediately
@@ -150,6 +209,34 @@ am_browser_cache_refs(){
   done | sort -u
 }
 
+# Where each browser tool keeps its cache on this platform. Overridable, because
+# these differ per OS *and* per user config — assume nothing, probe the paths the
+# tool actually uses and let an env var redirect any of them.
+#   AM_PLAYWRIGHT_CACHE, AM_PUPPETEER_CACHE
+am_browser_cache_roots(){
+  local d
+  if [ -n "${AM_PLAYWRIGHT_CACHE:-}" ]; then
+    printf '%s\n' "$AM_PLAYWRIGHT_CACHE"
+  else
+    case "$AM_PLATFORM" in
+      macos) d="$HOME/Library/Caches/ms-playwright" ;;
+      *)     d="${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright" ;;
+    esac
+    [ -d "$d" ] && printf '%s\n' "$d"
+    # A non-default PLAYWRIGHT_BROWSERS_PATH means the tool never populated the
+    # standard cache at all. Report it so a prune can see where browsers really are.
+    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && [ "$PLAYWRIGHT_BROWSERS_PATH" != "0" ]; then
+      [ -d "$PLAYWRIGHT_BROWSERS_PATH" ] && printf '%s\n' "$PLAYWRIGHT_BROWSERS_PATH"
+    fi
+  fi
+  if [ -n "${AM_PUPPETEER_CACHE:-}" ]; then
+    printf '%s\n' "$AM_PUPPETEER_CACHE"
+  else
+    d="${PUPPETEER_CACHE_DIR:-$HOME/.cache/puppeteer}"
+    [ -d "$d" ] && printf '%s\n' "$d"
+  fi
+}
+
 # am_browser_cache_prune <cache_root> <dry:0|1> <emit_fn>
 # Removes superseded browser revisions, keeping:
 #   * any revision pinned by an installed playwright-core (.links),
@@ -160,6 +247,15 @@ am_browser_cache_prune(){
   [ -d "$root" ] || return 0
   local keep="${BROWSER_KEEP_NEWEST:-1}"
   local refs; refs="$(am_browser_cache_refs "$root")"
+  # Callers scanning live repos (e.g. `browser-guard gc`) pass extra pins here.
+  # The `.links` map is authoritative only for caches Playwright itself wrote to;
+  # a *shared* root is populated by us, so the live repo scan is the real truth.
+  # Format: "name rev; name rev; ..." separated by ';'.
+  if [ -n "${AM_BROWSER_KEEP:-}" ]; then
+    refs="$(printf '%s\n%s\n' "$refs" \
+      "$(printf '%s' "$AM_BROWSER_KEEP" | tr ';' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$')" \
+      | sort -u)"
+  fi
 
   # Collect "<mtime> <name> <revision> <path>" for revision dirs.
   local cand="" d base rev
@@ -188,7 +284,7 @@ am_browser_cache_prune(){
     rv="${line%% *}"; path="${line#* }"
     if printf '%s\n' "$refs_norm" | grep -qx "$nm $rv"; then
       "$emit" SKIP "$nm r$rv kept — pinned by an installed playwright-core"
-    elif am_in_use "$path"; then
+    elif am_browser_dir_in_use "$path"; then
       "$emit" SKIP "$nm r$rv kept — currently in use"
     else
       unreferenced="$unreferenced$mt $nm $rv $path
@@ -258,15 +354,13 @@ am_reclaim_caches(){
 
   # Browser binaries: superseded revisions only, never a pinned one. NOT the
   # rm -rf that used to be here — see the browser-caches section above for why
-  # deleting the whole cache costs back every byte it reclaims.
-  case "$AM_PLATFORM" in
-    macos) d="$HOME/Library/Caches/ms-playwright" ;;
-    *)     d="$HOME/.cache/ms-playwright" ;;
-  esac
-  am_browser_cache_prune "$d" "$dry" "$emit"
-  # Puppeteer keeps its own cache (Chrome-for-Testing builds) in the same style,
-  # at the same path on both platforms.
-  am_browser_cache_prune "$HOME/.cache/puppeteer" "$dry" "$emit"
+  # deleting the whole cache costs back every byte it reclaims. Roots are probed
+  # per platform and honour AM_PLAYWRIGHT_CACHE / AM_PUPPETEER_CACHE overrides,
+  # so a custom PLAYWRIGHT_BROWSERS_PATH is respected rather than assumed away.
+  local bd
+  while IFS= read -r bd; do
+    [ -n "$bd" ] && am_browser_cache_prune "$bd" "$dry" "$emit"
+  done < <(am_browser_cache_roots)
 
   # Platform-specific tail.
   case "$AM_PLATFORM" in
